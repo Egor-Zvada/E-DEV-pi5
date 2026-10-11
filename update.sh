@@ -14,6 +14,9 @@ for path in /etc/systemd/system/e-dev-* /etc/systemd/system/lxconsole.service; d
 done
 cp -a /etc/bash_completion.d/e-dev "$BACKUP_DIR/completion"
 cp -a /usr/local/share/man/man1/e-dev.1 "$BACKUP_DIR/e-dev.1"
+if [[ -f /etc/systemd/journald.conf.d/e-dev.conf ]]; then
+    cp -a /etc/systemd/journald.conf.d/e-dev.conf "$BACKUP_DIR/journald.conf"
+fi
 chmod -R go-rwx "$BACKUP_DIR"
 bash "$REPO_DIR/scripts/deploy.sh"
 if ! command -v dialog >/dev/null || ! command -v ethtool >/dev/null; then

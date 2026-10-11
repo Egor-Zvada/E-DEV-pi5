@@ -342,6 +342,10 @@ VPN off закрывает VPN\-контейнерам интернет. Wi\-Fi 
   sudo systemctl list\-timers 'e\-dev\-*'
   sudo journalctl \-u e\-dev\-vpn \-u e\-dev\-dns \-u e\-dev\-vpn\-health \-u e\-dev\-auto \-n 50 \-\-no\-pager
 
+Журнал сохраняется между загрузками: лимит 64 MiB, срок до 7 дней.
+После сбоя перезапуска: sudo journalctl \-b \-1 \-n 100 \-\-no\-pager.
+Один успешный reboot не исключает повторения сбоя.
+
 VPN\-связь отсутствует: проверить upstream, handshake и vpn status.
 Manual не переключается сам; выберите другой через e\-dev vpn manual.
 Default использует основной/резерв; Auto — результаты замеров и проверку связи.

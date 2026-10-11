@@ -18,7 +18,11 @@ install -m 644 "$REPO_DIR/docs/e-dev.1" /usr/local/share/man/man1/e-dev.1
 install -m 644 "$REPO_DIR/config/e-dev-welcome.sh" /etc/profile.d/e-dev-welcome.sh
 install -m 644 "$REPO_DIR/config/90-e-dev-vpn.conf" /etc/sysctl.d/90-e-dev-vpn.conf
 install -m 644 "$REPO_DIR/config/systemd/"* /etc/systemd/system/
+install -d -m 755 /etc/systemd/journald.conf.d
+install -m 644 "$REPO_DIR/config/journald/e-dev.conf" /etc/systemd/journald.conf.d/e-dev.conf
 install -m 644 "$REPO_DIR/scripts/bootstrap_lxconsole.py" /opt/e-dev/bootstrap_lxconsole.py
 # This was a one-time override on the original Pi; the shipped service includes it.
 rm -f /etc/systemd/system/e-dev-geo-update.service.d/scheduled.conf
 systemctl daemon-reload
+systemctl try-restart systemd-journald.service
+journalctl --flush

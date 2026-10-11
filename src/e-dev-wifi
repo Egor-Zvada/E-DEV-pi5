@@ -19,6 +19,16 @@ PRIVATE = [I.IPv4Network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.
 CONTAINERS = [I.IPv4Network(n) for n in ('10.43.0.0/24', '10.158.92.0/24')]
 
 
+def out_device():
+    path = B/'wifi.json'
+    data = json.loads(path.read_text()) if path.exists() else {}
+    return 'edevbr0' if data.get('interface')=='edevbr0' else 'wlan0'
+
+
+def connection():
+    return 'E-DEV-OUT' if out_device()=='edevbr0' else CONNECTION
+
+
 def call(*args, input=None):
     return S.run(args, text=True, capture_output=True, input=input,
                  stdin=S.DEVNULL if input is None else None, timeout=45, check=True).stdout.strip()
@@ -40,7 +50,7 @@ def lock(name):
 
 def current():
     values = call('nmcli', '-g', 'ipv4.addresses,ipv4.shared-dhcp-range,ipv4.shared-dhcp-lease-time',
-                  'connection', 'show', CONNECTION).split('\n')
+                  'connection', 'show', connection()).split('\n')
     if len(values) != 3 or not values[0]:
         raise ValueError('У AP должен быть один настроенный IPv4 с маской.')
     return dict(address=values[0], dhcp_range=values[1], lease=int(values[2]))
@@ -55,7 +65,7 @@ def validate(data, routes):
         raise ValueError('Адрес Pi не может быть адресом сети или broadcast.')
     occupied = list(CONTAINERS)
     for row in routes:
-        if row.get('dev') == 'wlan0' or row.get('dst', 'default') == 'default':
+        if row.get('dev') in ('wlan0',out_device()) or row.get('dst', 'default') == 'default':
             continue
         occupied.append(I.IPv4Network(row['dst'], strict=False))
     if any(net.overlaps(n) for n in occupied):
@@ -83,7 +93,7 @@ def kernel_routes():
 def show():
     data = current()
     ap = I.IPv4Interface(data['address'])
-    print('Wi-Fi AP · wlan0')
+    print('OUT · '+out_device()+' · Wi-Fi AP wlan0')
     print('Адрес Pi: '+str(ap)+'; подсеть: '+str(ap.network))
     print('DHCP: '+(data['dhcp_range'].replace(',', ' — ') or 'автоматический диапазон NetworkManager'))
     print('Аренда DHCP: '+str(data['lease'] or 3600)+' с')
@@ -96,7 +106,7 @@ def show():
 
 
 def modify(data):
-    call('nmcli', 'connection', 'modify', CONNECTION, 'ipv4.method', 'shared',
+    call('nmcli', 'connection', 'modify', connection(), 'ipv4.method', 'shared',
          'ipv4.addresses', data['address'], 'ipv4.shared-dhcp-range', data['dhcp_range'],
          'ipv4.shared-dhcp-lease-time', str(data['lease']), 'ipv4.never-default', 'yes')
 
@@ -117,7 +127,7 @@ def block_ap():
         prefix = ''
     call('nft', '-f', '-', input=prefix+'''table inet e_dev_wifi_change {
  chain forward { type filter hook forward priority -20; policy accept;
-  iifname "wlan0" counter drop
+  iifname { "wlan0", "edevbr0" } counter drop
  }
 }
 ''')
@@ -130,6 +140,8 @@ def unblock_ap():
 def apply():
     with lock('e-dev-wifi'), lock('e-dev-policy'), lock('e-dev-vpn'):
         data = validate(json.loads(REQUEST.read_text()), kernel_routes())
+        if out_device()=='edevbr0':
+            data['interface'] = 'edevbr0'
         old = current()
         settings = B/'wifi.json'
         old_settings = settings.read_text() if settings.exists() else None
@@ -144,7 +156,7 @@ def apply():
             modify(data)
             save(settings, data)
             dns_address(data['address'])
-            call('nmcli', '--wait', '30', 'connection', 'up', CONNECTION)
+            call('nmcli', '--wait', '30', 'connection', 'up', connection())
             runtime['routes'](mode)
             runtime['guard'](mode)
             call('systemctl', 'restart', 'e-dev-dns')
@@ -158,7 +170,7 @@ def apply():
                 else:
                     settings.write_text(old_settings)
                 (B/'dns.conf').write_text(old_dns)
-                call('nmcli', '--wait', '30', 'connection', 'up', CONNECTION)
+                call('nmcli', '--wait', '30', 'connection', 'up', connection())
                 runtime['routes'](mode)
                 runtime['guard'](mode)
                 call('systemctl', 'restart', 'e-dev-dns')
@@ -175,9 +187,10 @@ def apply():
 def queue(data):
     data = validate(data, kernel_routes())
     with lock('e-dev-wifi'):
-        state = call('systemctl', 'show', '-p', 'ActiveState', '--value', 'e-dev-wifi-apply.service')
-        if state in ('active', 'activating', 'deactivating'):
-            raise ValueError('Предыдущее изменение ещё выполняется.')
+        for unit in ('e-dev-wifi-apply.service','e-dev-lan-apply.service'):
+            state = call('systemctl', 'show', '-p', 'ActiveState', '--value', unit)
+            if state in ('active', 'activating', 'deactivating'):
+                raise ValueError('Предыдущее изменение ещё выполняется.')
         save(REQUEST, data, 0o600)
         try:
             call('systemctl', 'start', '--no-block', 'e-dev-wifi-apply.service')

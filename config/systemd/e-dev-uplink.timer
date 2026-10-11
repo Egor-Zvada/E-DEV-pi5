@@ -1,0 +1,10 @@
+[Unit]
+Description=E-DEV periodic primary/backup uplink checks
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=20s
+Unit=e-dev-uplink.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""dialog-based IN/OUT setup. Arrows, Space, Enter, Escape; no Python UI deps."""
+import importlib.machinery
+import importlib.util
+import json
+import runpy
+import os
+import pathlib as P
+import shutil
+import subprocess as S
+import sys
+import time
+
+path = P.Path('/usr/local/sbin/e-dev-lan')
+if not path.exists():
+    path = P.Path(__file__).with_name('e-dev-lan')
+loader = importlib.machinery.SourceFileLoader('lan_backend',str(path))
+lan = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader))
+loader.exec_module(lan)
+
+
+class Dialog:
+    def run(self, title, kind, prompt, *items, initial=None):
+        size = shutil.get_terminal_size((80,24))
+        if size.columns<60 or size.lines<20:
+            raise ValueError('Для меню увеличьте терминал минимум до 60×20.')
+        height, width = min(22,size.lines-2), min(90,size.columns-4)
+        args = ['dialog','--stdout','--clear','--no-tags','--backtitle','Egor Zvada · E-DEV · egor-zvada.ru',
+                '--title',title,'--ok-label','ОК','--cancel-label','Назад','--yes-label','Да','--no-label','Нет',
+                kind,prompt,str(height),str(width)]
+        if kind in ('--menu','--checklist','--radiolist'):
+            args += [str(max(4,height-10))]+list(items)
+        elif kind=='--inputbox':
+            args += [initial or '']
+        result = S.run(args,text=True,stdout=S.PIPE)
+        return result.stdout.rstrip('\n') if result.returncode==0 else None
+
+    def menu(self,title,prompt,choices):
+        return self.run(title,'--menu',prompt,*[value for pair in choices for value in pair])
+
+    def input(self,title,prompt,initial=''):
+        return self.run(title,'--inputbox',prompt,initial=initial)
+
+    def message(self,title,prompt):
+        self.run(title,'--msgbox',prompt)
+
+    def yes(self,title,prompt):
+        return self.run(title,'--yesno',prompt) is not None
+
+    def checklist(self,title,prompt,choices,selected):
+        result = self.run(title,'--checklist',prompt,*[value for key,label in choices
+                         for value in (key,label,'on' if key in selected else 'off')])
+        if result is None:
+            return None
+        # Machine identifiers contain no spaces/quotes; dialog quotes each selected tag.
+        return [tag.strip('"') for tag in result.split()]
+
+
+def label(key,entry,devices):
+    name = lan.resolve(entry,devices)
+    return (name or entry['ifname']+' · не подключён')+' · '+entry['type']+(' · '+entry['ssid'] if entry.get('ssid') else '')
+
+
+def name(plan,key,devices):
+    entry = plan['inputs'].get(key,{})
+    return (lan.resolve(entry,devices) or entry['ifname']) if entry else 'нет'
+
+
+def review(plan):
+    devices = lan.inventory()
+    lines = ['IN:']+[label(k,e,devices) for k,e in plan['inputs'].items()]
+    lines += ['','OUT: общий мост '+lan.BRIDGE]+[label(k,e,devices) for k,e in plan['outputs'].items()]
+    lines += ['','Основной: '+name(plan,plan['primary'],devices),'Резерв: '+(', '.join(name(plan,k,devices) for k in plan['backups']) or 'нет'),
+              'Автопереход: '+('ВКЛ' if plan['failover'] else 'ВЫКЛ')]
+    return '\n'.join(lines)
+
+
+def commit(ui,plan):
+    try:
+        plan = lan.validate(plan)
+        if not ui.yes('Применить настройки?',review(plan)+'\n\nWi-Fi переподключится. SSH при смене своего интерфейса может оборваться.\nСлужба продолжит применение; при ошибке выполнит откат.'):
+            return False
+        started = time.time()
+        lan.queue(plan)
+        # The system service, not this terminal process, owns the transaction.
+        ui.run('Применение','--infobox','Служба применяет настройки. Это может занять до минуты.\nПри разрыве SSH подключитесь по текущему IP через другую сеть.')
+        for _ in range(150):
+            result = lan.read(lan.RESULT,{})
+            if result.get('updated',0)>=started:
+                if result['success']:
+                    ui.message('Готово','Настройки сохранены и применены.\nТекущие адреса: e-dev links')
+                    return True
+                ui.message('Ошибка',result.get('error','Ошибка применения')+'\n'+
+                           ('Прежние настройки восстановлены.' if result.get('recovered') else
+                            'OUT-трафик закрыт. Проверьте сеть через Ethernet/локальную консоль.')+
+                           '\nЖурнал: journalctl -u e-dev-lan-apply')
+                return False
+            time.sleep(1)
+        ui.message('Применение продолжается','Служба ещё работает.\nЖурнал: journalctl -u e-dev-lan-apply')
+    except (ValueError,OSError,S.SubprocessError) as error:
+        ui.message('Ошибка',str(error))
+    return False
+
+
+def wifi_network(ui,entry,name):
+    scanned = lan.call('nmcli','-g','SSID','device','wifi','list','ifname',name,'--rescan','yes',check=False).stdout.splitlines()
+    ssids = sorted({s.replace('\\:',':').replace('\\\\','\\') for s in scanned if s})
+    choices = [(str(i),ssid) for i,ssid in enumerate(ssids)]
+    picked = ui.menu('Wi-Fi IN','Выберите сеть или введите SSID вручную.',choices+[('manual','Ввести SSID / скрытая сеть')])
+    if picked is None:
+        return False
+    ssid = ui.input('SSID','Имя Wi-Fi сети:',entry.get('ssid','')) if picked=='manual' else ssids[int(picked)]
+    if ssid is None:
+        return False
+    security = ui.menu('Защита Wi-Fi IN','Тип защиты выбранной сети:',
+                       [('wpa-psk','WPA2 Personal / WPA2-WPA3'),('sae','WPA3 Personal'),('none','Открытая сеть')])
+    if security is None:
+        return False
+    entry.update(ssid=ssid,security=security)
+    if security!='none':
+        password = ui.run('Wi-Fi пароль','--passwordbox','Пароль сети (ввод скрыт).')
+        if password is None:
+            return False
+        entry['psk'] = password
+    else:
+        entry.pop('psk',None)
+    return True
+
+
+def ip_settings(ui,entry):
+    method = ui.menu('IPv4 IN','Как этот интерфейс получает адрес?',
+                     [('dhcp','DHCP — адрес и шлюз от сети'),('static','Статический адрес и шлюз')])
+    if method is None:
+        return False
+    if method=='static':
+        address = ui.input('Статический IPv4','Адрес с маской, например 192.168.20.10/24:',entry.get('address',''))
+        if address is None:
+            return False
+        gateway = ui.input('Шлюз','Шлюз в той же подсети:',entry.get('gateway',''))
+        if gateway is None:
+            return False
+        entry.update(address=address,gateway=gateway)
+    else:
+        entry.update(address='',gateway='')
+    dns = ui.input('DNS IN','DNS IPv4 через пробел:', ' '.join(entry.get('dns',['1.1.1.1','8.8.8.8'])))
+    if dns is None:
+        return False
+    entry.update(method=method,dns=dns.split())
+    return True
+
+
+def available(plan,devices):
+    assigned = {entry['mac'] for zone in ('inputs','outputs') for entry in plan[zone].values()}
+    return [d for d in devices if d['mac'] not in assigned]
+
+
+def add_device(ui,zone):
+    plan,devices = lan.config(),lan.inventory()
+    free = available(plan,devices)
+    if not free:
+        ui.message('Устройства','Свободных физических интерфейсов нет.\nПодключите USB Ethernet/Wi-Fi и откройте список снова.\nДля переноса между зонами сначала освободите внешний интерфейс.')
+        return
+    choice = ui.menu('Добавить в '+('IN' if zone=='inputs' else 'OUT'),'Выберите устройство.',
+                     [(str(i),d['ifname']+' · '+d['type']+' · '+d['mac']) for i,d in enumerate(free)])
+    if choice is None:
+        return
+    device = free[int(choice)]
+    key = lan.identifier(device)
+    if zone=='inputs':
+        entry = lan.new_input(device,plan)
+        if device['type']=='wifi' and not wifi_network(ui,entry,device['ifname']):
+            return
+        if not ip_settings(ui,entry):
+            return
+    else:
+        if device['type']=='wifi':
+            info = lan.call('iw','dev',device['ifname'],'info',check=False).stdout
+            import re
+            phy = re.search(r'wiphy\s+(\d+)',info)
+            modes = lan.call('iw','phy','phy'+phy.group(1),'info',check=False).stdout if phy else ''
+            if not re.search(r'\* AP\s*\n',modes):
+                ui.message('OUT Wi-Fi','Драйвер этого адаптера не сообщает поддержку AP.\nЕго можно добавить в IN как Wi-Fi клиент.')
+                return
+        entry = dict(id=key,ifname=device['ifname'],mac=device['mac'],type=device['type'],profile='E-DEV-OUT-'+key)
+    plan[zone][key] = entry
+    commit(ui,plan)
+
+
+def interface_menu(ui,zone,key):
+    while True:
+        plan,devices = lan.config(),lan.inventory()
+        if key not in plan[zone]:
+            return
+        entry = plan[zone][key]
+        choices = [('info','Состояние и адреса')]
+        if zone=='inputs':
+            choices += [('ip','DHCP / статический IPv4 / DNS')]
+            if entry['type']=='wifi':
+                choices += [('wifi','Wi-Fi сеть и пароль')]
+        if key not in ('eth0','wlan0'):
+            choices += [('remove','Освободить интерфейс из этой зоны')]
+        choice = ui.menu(label(key,entry,devices),'IN: отдельное подключение интернета.\nOUT: порт общей локальной сети.',choices)
+        if choice is None:
+            return
+        if choice=='info':
+            ifname = lan.resolve(entry,devices)
+            device = next((d for d in devices if d['ifname']==ifname),{})
+            state = lan.read(lan.STATE,{})
+            role = 'основной' if key==plan['primary'] else 'резерв' if key in plan['backups'] else 'подключён заранее, в резерв не включён'
+            ui.message('Интерфейс',label(key,entry,devices)+'\nMAC: '+entry['mac']+
+                       '\nIP: '+(', '.join(device.get('ips',[])) or 'нет')+
+                       ('\nРоль: '+role+'\nАктивный IN: '+name(plan,state.get('active'),devices) if zone=='inputs' else
+                        '\nIP/DHCP находятся на '+lan.BRIDGE+'; настройки: e-dev wifi settings'))
+        elif choice=='ip' and ip_settings(ui,entry):
+            commit(ui,plan)
+        elif choice=='wifi':
+            ifname = lan.resolve(entry,devices)
+            if not ifname:
+                ui.message('Wi-Fi','Для выбора сети подключите адаптер.')
+            elif wifi_network(ui,entry,ifname):
+                commit(ui,plan)
+        elif choice=='remove':
+            if key==plan['primary']:
+                ui.message('Основной вход','Сначала выберите другой основной интерфейс в меню резервирования.')
+                continue
+            del plan[zone][key]
+            plan['backups'] = [n for n in plan['backups'] if n!=key]
+            if commit(ui,plan):
+                return
+
+
+def zone_menu(ui,zone):
+    while True:
+        plan,devices = lan.config(),lan.inventory()
+        choices = [(key,label(key,entry,devices)+(' · закреплён' if key in ('eth0','wlan0') else ''))
+                   for key,entry in plan[zone].items()]+[('add','Добавить обнаруженное устройство')]
+        choice = ui.menu('IN · интернет' if zone=='inputs' else 'OUT · локальная сеть',
+                         'Стрелки — выбор, Enter — открыть, Esc — назад.',choices)
+        if choice is None:
+            return
+        if choice=='add':
+            add_device(ui,zone)
+        else:
+            interface_menu(ui,zone,choice)
+
+
+def roles(ui):
+    while True:
+        plan,devices = lan.config(),lan.inventory()
+        choice = ui.menu('Основной и резервные входы','Основной: '+name(plan,plan['primary'],devices)+'\nРезерв: '+(', '.join(name(plan,k,devices) for k in plan['backups']) or 'нет')+
+                         '\nАвтопереход: '+('ВКЛ' if plan['failover'] else 'ВЫКЛ'),
+                         [('primary','Выбрать основной'),('backups','Выбрать резервные · Space'),
+                          ('order','Порядок резервов'),('auto','Включить / выключить автопереход')])
+        if choice is None:
+            return
+        choices = [(k,label(k,e,devices)) for k,e in plan['inputs'].items()]
+        if choice=='primary':
+            selected = ui.menu('Основной вход','Интернет будет идти через выбранный интерфейс.',choices)
+            if selected is None:
+                continue
+            plan['primary'] = selected
+            plan['backups'] = [n for n in plan['backups'] if n!=selected]
+        elif choice=='backups':
+            if len(choices)<2:
+                ui.message('Резервные входы','Других IN-интерфейсов пока нет.\nПодключите адаптер и добавьте его в IN.')
+                continue
+            selected = ui.checklist('Резервные входы','Space — отметить, Enter — сохранить.\nИспользуются только при включённом автопереходе.',
+                                     [(k,label) for k,label in choices if k!=plan['primary']],plan['backups'])
+            if selected is None:
+                continue
+            plan['backups'] = [n for n in plan['backups'] if n in selected]+[n for n in selected if n not in plan['backups']]
+        elif choice=='order':
+            remaining,ordered = list(plan['backups']),[]
+            if not remaining:
+                ui.message('Резерв','Сначала отметьте резервные интерфейсы.')
+                continue
+            while remaining:
+                selected = ui.menu('Порядок резервов','Выберите резерв номер '+str(len(ordered)+1)+'.',
+                                   [(k,label(k,plan['inputs'][k],devices)) for k in remaining])
+                if selected is None:
+                    break
+                ordered.append(selected)
+                remaining.remove(selected)
+            if remaining:
+                continue
+            plan['backups'] = ordered
+        else:
+            plan['failover'] = not plan['failover']
+        commit(ui,plan)
+
+
+def dhcp_menu(ui):
+    backend = runpy.run_path('/usr/local/sbin/e-dev-wifi')
+    while True:
+        data = backend['current']()
+        choice = ui.menu('OUT · подсеть и DHCP','Адрес: '+data['address']+'\nDHCP: '+(data['dhcp_range'] or 'автоматический')+'\nАренда: '+str(data['lease'] or 3600)+' с',
+                         [('address','Адрес Pi / подсеть'),('pool','Диапазон DHCP'),('lease','Срок аренды')])
+        if choice is None:
+            return
+        if choice=='address':
+            value = ui.input('Адрес OUT','IPv4 с маской, например 192.168.50.1/24.\nDHCP-пул станет автоматическим.',data['address'])
+            if value is None:
+                continue
+            data.update(address=value,dhcp_range='')
+        elif choice=='pool':
+            value = ui.input('Диапазон DHCP','auto или начало и конец через пробел:',data['dhcp_range'].replace(',',' ') or 'auto')
+            if value is None:
+                continue
+            data['dhcp_range'] = '' if value.strip()=='auto' else ','.join(value.split())
+        else:
+            value = ui.input('Аренда DHCP','Секунды; 0 — час по умолчанию:',str(data['lease']))
+            if value is None:
+                continue
+            data['lease'] = int(value)
+        data = backend['validate'](data,backend['kernel_routes']())
+        if not ui.yes('Применить OUT?', 'Адрес: '+data['address']+'\nDHCP: '+(data['dhcp_range'] or 'автоматический')+'\nАренда: '+str(data['lease'] or 3600)+' с\n\nКлиенты переподключатся. SSH через OUT может оборваться.'):
+            continue
+        # Same detached transaction used by e-dev wifi settings.
+        backend['queue'](data)
+        ui.run('Применение','--infobox','Применяю подсеть и DHCP…')
+        for _ in range(150):
+            if not backend['REQUEST'].exists():
+                result = lan.output('systemctl','show','-p','Result','--value','e-dev-wifi-apply.service')
+                ui.message('OUT','Настройки применены. Текущие ссылки: e-dev links' if result=='success' else
+                           'Изменение не завершилось. Прежние настройки восстановлены либо OUT закрыт.\nЖурнал: journalctl -u e-dev-wifi-apply')
+                break
+            time.sleep(1)
+        else:
+            ui.message('Применение продолжается','Журнал: journalctl -u e-dev-wifi-apply')
+
+
+def main():
+    if os.geteuid()!=0 or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError('Откройте e-dev lan setup в терминале с sudo.')
+    if not shutil.which('dialog'):
+        raise ValueError('Нужен пакет dialog: sudo apt-get install dialog')
+    ui = Dialog()
+    if not (lan.B/'lan.json').exists():
+        if not commit(ui,lan.config()):
+            return
+    while True:
+        state = lan.read(lan.STATE,{})
+        choice = ui.menu('E-DEV · LAN setup','Активный IN: '+name(lan.config(),state.get('active'),lan.inventory())+'\nOUT: общий мост '+lan.BRIDGE,
+                         [('in','IN · источники интернета'),('out','OUT · Wi-Fi и проводные клиенты'),
+                          ('roles','Основной / резервные / автопереход'),('dhcp','OUT · подсеть и DHCP'),
+                          ('check','Проверить входы сейчас'),('status','Состояние всей сети')])
+        if choice is None:
+            return
+        try:
+            if choice in ('in','out'):
+                zone_menu(ui,'inputs' if choice=='in' else 'outputs')
+            elif choice=='roles':
+                roles(ui)
+            elif choice=='dhcp':
+                dhcp_menu(ui)
+            elif choice=='check':
+                ui.run('Проверка','--infobox','Проверяю доступ к интернету через разрешённые IN-интерфейсы…')
+                lan.call('systemctl','start','e-dev-uplink.service',timeout=150)
+                state = lan.read(lan.STATE,{})
+                plan,devices = lan.config(),lan.inventory()
+                rows = ['Активный IN: '+name(plan,state.get('active'),devices)]
+                for key,entry in plan['inputs'].items():
+                    check = state.get('checks',{}).get(key)
+                    rows.append(name(plan,key,devices)+' · '+('интернет доступен' if check else 'связь не подтверждена' if check is False else 'не участвует в резервировании'))
+                ui.message('Проверка','\n'.join(rows))
+            elif choice=='status':
+                ui.message('Сеть',review(lan.config())+'\n\nOUT IPv4: '+', '.join(lan.read_addresses().get(lan.BRIDGE,[])))
+        except (ValueError,OSError,S.SubprocessError) as error:
+            ui.message('Ошибка',str(error))
+
+
+if __name__=='__main__':
+    try:
+        main()
+    except (ValueError,OSError,S.SubprocessError) as error:
+        print(str(error),file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        S.run(['clear'])

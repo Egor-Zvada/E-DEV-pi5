@@ -113,3 +113,12 @@ class WifiSettingsTests(unittest.TestCase):
                              [('guard','192.168.50.1/24'),('guard','10.42.0.1/24')])
             self.assertEqual((base/'dns.conf').read_text(), old_dns)
             self.assertEqual(events[-2:], [('systemctl','restart','e-dev-dns'),('unblock',)])
+
+    def test_bridged_out_settings_use_bridge_and_ignore_own_connected_route(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(w,'B',pathlib.Path(tmp)):
+            (pathlib.Path(tmp)/'wifi.json').write_text('{"interface":"edevbr0"}')
+            data=self.candidate()
+            self.assertEqual(w.validate(data,[{'dev':'edevbr0','dst':'192.168.50.0/24'}]),data)
+            with patch.object(w,'call') as call:
+                w.modify(data)
+            self.assertEqual(call.call_args.args[:4],('nmcli','connection','modify','E-DEV-OUT'))

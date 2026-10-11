@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess as S
 import sys
+import time
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -270,7 +271,7 @@ def main():
  server string = E-DEV Files
  server role = standalone server
  map to guest = Never
- interfaces = lo eth0 wlan0
+ interfaces = lo eth* en* wl* edevbr0
  bind interfaces only = yes
  server min protocol = SMB2
 
@@ -290,6 +291,20 @@ def main():
         run('systemctl', 'enable', '--now', timer)
     # The firewall, policy routes and DNS are ready before NM can activate the AP.
     init_ap(args, password)
+    # The asynchronous transaction survives an Ethernet/SSH reconnect.
+    started = time.time()
+    run('/usr/local/sbin/e-dev-lan', 'init')
+    for _ in range(180):
+        result_path = P.Path('/run/e-dev-lan-apply.json')
+        result = json.loads(result_path.read_text()) if result_path.exists() else {}
+        if result.get('updated',0)>=started:
+            if not result['success']:
+                raise ValueError('Не создан мост OUT: '+result.get('error','см. e-dev-lan-apply'))
+            break
+        time.sleep(1)
+    else:
+        raise ValueError('Применение LAN ещё не завершилось: journalctl -u e-dev-lan-apply')
+    run('systemctl','enable','--now','e-dev-network.service','e-dev-uplink.timer')
     run('/usr/local/sbin/e-dev-geo-update', check=False)
     manifest = {'installed': datetime.datetime.now().astimezone().isoformat(), 'user': args.user,
                 'hostname': args.hostname, 'country': args.country, 'timezone': args.timezone}

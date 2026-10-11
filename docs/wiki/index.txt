@@ -7,6 +7,7 @@ Egor Zvada • E-DEV • egor-zvada.ru
   e-dev wifi clients           число клиентов Wi-Fi, IP и MAC
   e-dev wifi status             точка, режим трафика, VPN-сервер
   e-dev wifi settings          меню подсети AP и DHCP
+  e-dev lan setup              меню IN/OUT и резервных входов
   e-dev vpn on|off|status       включение и выключение самого туннеля
   e-dev vpn settings           меню выбора default / manual / auto
   e-dev vpn manual             меню выбора одного сервера
@@ -19,6 +20,7 @@ Egor Zvada • E-DEV • egor-zvada.ru
 Разделы (стрелки / PgUp / PgDn, /поиск, q — выход):
   e-dev help vpn               туннель, Auto и управление профилями
   e-dev help wifi              режимы AP, гибрид, IP-база, клиенты
+  e-dev help lan               интерфейсы, мост OUT и резервирование
   e-dev help panels            LXConsole и Incus UI
   e-dev help files             файлы с Mac/iPhone
   e-dev help passwd            смена паролей
@@ -26,10 +28,3 @@ Egor Zvada • E-DEV • egor-zvada.ru
   e-dev help troubleshoot      диагностика
   e-dev help all               вся инструкция
   man e-dev                    системная man-страница
-
-Tab дополняет команды, имена профилей, контейнеры и пути конфигов.
-Имена команды: e-dev, E-DEV, E-dev, edev. e-d + Tab → e-dev.
-Дашборд status: ASCII-логотип, графики и режимы; показатели каждые 2 с.
-q — выход, l — ссылки, r — обновить, p — пауза/продолжение бегущей строки.
-Логотип: компактный от 80 столбцов, полный сбоку от 128×24.
-wifi vpn on/off меняет маршрут AP, vpn on/off — сам туннель.

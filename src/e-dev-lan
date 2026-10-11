@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Physical IN/OUT roles, shared bridge and autonomous IPv4 uplink failover."""
+import configparser
+import contextlib
+import copy
+import fcntl
+import ipaddress as I
+import json
+import os
+import pathlib as P
+import re
+import runpy
+import shutil
+import subprocess as S
+import sys
+import time
+
+B = P.Path('/etc/e-dev')
+BRIDGE = 'edevbr0'
+BRIDGE_PROFILE = 'E-DEV-OUT'
+KEYS = P.Path('/etc/NetworkManager/system-connections')
+SAMBA = P.Path('/etc/samba/smb.conf')
+REQUEST = P.Path('/run/e-dev-lan-request.json')
+STATE = P.Path('/run/e-dev-lan-state.json')
+RESULT = P.Path('/run/e-dev-lan-apply.json')
+BACKUPS = P.Path('/opt/e-dev/backups')
+PROBES = ('https://1.1.1.1/cdn-cgi/trace', 'https://1.0.0.1/cdn-cgi/trace')
+PROTO = '241'
+
+
+def call(*args, check=True, input=None, timeout=45):
+    env = dict(os.environ, LC_ALL='C', PAGER='cat', NMCLI_PAGER='cat')
+    result = S.run(args, text=True, capture_output=True, input=input,
+                   stdin=S.DEVNULL if input is None else None, env=env, timeout=timeout)
+    if check and result.returncode:
+        raise ValueError('Не выполнено: '+args[0]+'. '+result.stderr.strip()[:300])
+    return result
+
+
+def output(*args):
+    return call(*args).stdout.strip()
+
+
+def read(path, default=None):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def save(path, data, mode=0o644):
+    temp = path.with_name(path.name+'.new')
+    fd = os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    with os.fdopen(fd,'w') as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, indent=2)+'\n')
+    temp.chmod(mode)
+    temp.replace(path)
+
+
+@contextlib.contextmanager
+def lock(name):
+    with open('/run/'+name+'.lock', 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def inventory():
+    addresses = read_addresses()
+    devices = []
+    for link in json.loads(output('ip', '-j', 'link')):
+        name = link['ifname']
+        if not (P.Path('/sys/class/net')/name/'device').exists():
+            continue
+        kind = output('nmcli', '-g', 'GENERAL.TYPE', 'device', 'show', name)
+        if kind not in ('ethernet', 'wifi'):
+            continue
+        permanent = call('ethtool', '-P', name, check=False).stdout
+        match = re.search(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', permanent)
+        mac = (match.group() if match else link.get('permaddr', link.get('address', ''))).lower()
+        if mac == '00:00:00:00:00:00':
+            mac = link['address'].lower()
+        devices.append(dict(ifname=name, mac=mac, type=kind, up=link['operstate']=='UP',
+                            ips=addresses.get(name, [])))
+    return devices
+
+
+def read_addresses():
+    return {row['ifname']:[a['local']+'/'+str(a['prefixlen']) for a in row.get('addr_info', [])
+                          if a['scope']=='global'] for row in json.loads(output('ip', '-j', '-4', 'addr'))}
+
+
+def resolve(entry, devices):
+    return next((d['ifname'] for d in devices if d['mac']==entry['mac']), None)
+
+
+def identifier(device):
+    return device['ifname'] if device['ifname'] in ('eth0','wlan0') else 'usb-'+device['mac'].replace(':','')
+
+
+def new_input(device, plan):
+    used = {entry['table'] for entry in plan['inputs'].values()}
+    table = next(n for n in range(5000,5100) if n not in used)
+    key = identifier(device)
+    return dict(id=key, ifname=device['ifname'], mac=device['mac'], type=device['type'],
+                profile='E-DEV-IN-'+key, table=table, method='dhcp', address='', gateway='',
+                dns=['1.1.1.1','8.8.8.8'], ssid='')
+
+
+def config():
+    existing = read(B/'lan.json')
+    if existing is not None:
+        return existing
+    devices = inventory()
+    eth = next(d for d in devices if d['ifname']=='eth0')
+    wlan = next(d for d in devices if d['ifname']=='wlan0')
+    entry = new_input(eth, {'inputs':{}})
+    entry['profile'] = output('nmcli','-g','GENERAL.CON-UUID','device','show','eth0')
+    if not entry['profile'] or entry['profile']=='--':
+        raise ValueError('Для первого запуска подключите eth0 и настройте его в NetworkManager.')
+    fields = output('nmcli','-g','ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns',
+                    'connection','show',entry['profile']).split('\n')
+    fields += ['']*(4-len(fields))
+    if fields[0]=='manual':
+        entry.update(method='static',address=fields[1],gateway=fields[2],dns=fields[3].split(',') if fields[3] else entry['dns'])
+    return dict(version=1, inputs={'eth0':entry}, outputs={'wlan0':dict(id='wlan0',ifname='wlan0',
+                mac=wlan['mac'],type='wifi',profile='E-DEV-AP')}, primary='eth0',backups=[],failover=False)
+
+
+def validate(plan):
+    plan = copy.deepcopy(plan)
+    if 'eth0' not in plan['inputs'] or 'wlan0' not in plan['outputs']:
+        raise ValueError('eth0 закреплён в IN, wlan0 — в OUT.')
+    if len(plan['inputs'])>8 or len(plan['outputs'])>8:
+        raise ValueError('До восьми интерфейсов в каждой зоне.')
+    macs, tables = set(), set()
+    internal = [I.IPv4Interface(read(B/'wifi.json',{}).get('address','10.42.0.1/24')).network,
+                I.IPv4Network('10.43.0.0/24'), I.IPv4Network('10.158.92.0/24')]
+    for zone in ('inputs','outputs'):
+        for key, entry in plan[zone].items():
+            if not re.fullmatch(r'[a-z0-9-]{1,24}',key) or entry['id']!=key:
+                raise ValueError('Некорректный идентификатор устройства.')
+            if key in ('eth0','wlan0') and entry['ifname']!=key:
+                raise ValueError('Встроенные интерфейсы закреплены за своими зонами.')
+            if (key=='eth0' and entry['type']!='ethernet') or (key=='wlan0' and entry['type']!='wifi'):
+                raise ValueError('Тип встроенного интерфейса фиксирован.')
+            if (zone=='inputs' and key=='wlan0') or (zone=='outputs' and key=='eth0'):
+                raise ValueError('eth0 — только IN; wlan0 — только OUT.')
+            if entry['type'] not in ('ethernet','wifi') or not re.fullmatch(r'[0-9a-f]{2}(?::[0-9a-f]{2}){5}',entry['mac']):
+                raise ValueError('Нужен физический Ethernet/Wi-Fi интерфейс с MAC.')
+            if entry['mac'] in macs:
+                raise ValueError('Один интерфейс не может находиться в двух зонах.')
+            macs.add(entry['mac'])
+            if zone=='outputs':
+                continue
+            table = int(entry['table'])
+            if not 5000<=table<5100 or table in tables:
+                raise ValueError('Таблицы IN должны быть уникальны в диапазоне 5000–5099.')
+            tables.add(table)
+            if entry['method'] not in ('dhcp','static'):
+                raise ValueError('IN: DHCP или статический IPv4.')
+            if entry['method']=='static':
+                address = I.IPv4Interface(entry['address'])
+                gateway = I.IPv4Address(entry['gateway'])
+                if not 1<=address.network.prefixlen<=30 or address.ip in (address.network.network_address,address.network.broadcast_address):
+                    raise ValueError('Нужен обычный IPv4 хоста с маской /1–/30.')
+                if gateway not in address.network or gateway in (address.ip,address.network.network_address,address.network.broadcast_address):
+                    raise ValueError('Шлюз должен быть другим адресом внутри подсети IN.')
+                if any(address.network.overlaps(n) for n in internal):
+                    raise ValueError('Подсеть IN пересекается с OUT или сетью контейнеров.')
+            dns = [str(I.IPv4Address(n)) for n in entry['dns']]
+            if not 1<=len(dns)<=3 or any(I.IPv4Address(n).is_unspecified or I.IPv4Address(n).is_multicast or I.IPv4Address(n).is_loopback for n in dns):
+                raise ValueError('От одного до трёх DNS IPv4.')
+            entry['dns'] = dns
+            if entry['type']=='wifi':
+                if entry.get('security','wpa-psk') not in ('wpa-psk','sae','none'):
+                    raise ValueError('Wi-Fi IN: WPA2, WPA3 или открытая сеть.')
+                if not 1<=len(entry['ssid'].encode())<=32 or any(ord(c)<32 for c in entry['ssid']):
+                    raise ValueError('SSID Wi-Fi: 1–32 байта без управляющих символов.')
+                if 'psk' in entry and (not 8<=len(entry['psk'])<=63 or any(ord(c)<32 or ord(c)>126 for c in entry['psk'])):
+                    raise ValueError('Wi-Fi пароль: 8–63 печатных ASCII-символа.')
+    if plan['primary'] not in plan['inputs'] or len(set(plan['backups']))!=len(plan['backups']):
+        raise ValueError('Основной и резервные должны находиться в IN.')
+    if any(n not in plan['inputs'] or n==plan['primary'] for n in plan['backups']):
+        raise ValueError('Резервные входы не должны совпадать с основным.')
+    if not isinstance(plan['failover'],bool):
+        raise ValueError('Автопереключение: включено или выключено.')
+    return plan
+
+
+def public(plan):
+    plan = copy.deepcopy(plan)
+    for entry in plan['inputs'].values():
+        entry.pop('psk',None)
+    return plan
+
+
+def connected(entry, devices):
+    name = resolve(entry,devices)
+    if not name:
+        return None
+    active = output('nmcli','-g','GENERAL.CON-UUID','device','show',name)
+    uuid = call('nmcli','-g','connection.uuid','connection','show',entry['profile'],check=False).stdout.strip()
+    if active!=uuid or not uuid:
+        return None
+    rows = json.loads(call('ip','-j','-4','route','show','table',str(entry['table']),check=False).stdout or '[]')
+    default = next((r for r in rows if r.get('dst')=='default' and r.get('dev')==name and r.get('gateway')),None)
+    address = next(iter(next((d['ips'] for d in devices if d['ifname']==name),[])),None)
+    if not default or not address:
+        return None
+    net = I.IPv4Interface(address).network
+    internal = [I.IPv4Interface(read(B/'wifi.json',{}).get('address','10.42.0.1/24')).network,
+                I.IPv4Network('10.43.0.0/24'),I.IPv4Network('10.158.92.0/24')]
+    if any(net.overlaps(n) for n in internal):
+        return None
+    return dict(ifname=name,address=address,gateway=default['gateway'],table=entry['table'])
+
+
+def delete_rules(priority):
+    while call('ip','rule','del','priority',str(priority),check=False).returncode==0:
+        pass
+
+
+def routing(plan, devices):
+    links = {key:connected(entry,devices) for key,entry in plan['inputs'].items()}
+    # Rebuild only E-DEV's rule range. Standby defaults stay in their own tables.
+    for row in json.loads(output('ip','-j','rule')):
+        if 10000<=row.get('priority',0)<10200:
+            delete_rules(row['priority'])
+    for row in json.loads(output('ip','-j','-4','route','show','table','main')):
+        if str(row.get('protocol'))==PROTO and row.get('dst')!='default':
+            call('ip','route','del',row['dst'],'dev',row['dev'],'metric',str(row['metric']),check=False)
+    for key, link in links.items():
+        if not link:
+            continue
+        offset = link['table']-5000
+        address = I.IPv4Interface(link['address'])
+        call('ip','route','replace',str(address.network),'dev',link['ifname'],'src',str(address.ip),
+             'metric',str(500+offset),'proto',PROTO)
+        call('ip','rule','add','priority',str(10000+offset),'oif',link['ifname'],'lookup',str(link['table']))
+        call('ip','rule','add','priority',str(10100+offset),'from',str(address.ip)+'/32','lookup',str(link['table']))
+    return links
+
+
+def probe(link):
+    if not link:
+        return False
+    for url in PROBES:
+        response = call('curl','--interface',link['ifname'],'--noproxy','*','--fail','--silent',
+                        '--connect-timeout','2','--max-time','4',url,check=False,timeout=6)
+        if response.returncode==0 and 'ip=' in response.stdout:
+            return True
+    return False
+
+
+def choose(plan, previous, links, checks):
+    allowed = [plan['primary']]+(plan['backups'] if plan['failover'] else [])
+    failures = {key:0 if checks.get(key) else previous.get('failures',{}).get(key,0)+1 for key in allowed}
+    successes = {key:previous.get('successes',{}).get(key,0)+1 if checks.get(key) else 0 for key in allowed}
+    active = previous.get('active')
+    if not plan['failover']:
+        active = plan['primary'] if links.get(plan['primary']) else None
+    elif active in allowed and links.get(active) and failures[active]<3:
+        if active!=plan['primary'] and successes[plan['primary']]>=3:
+            active = plan['primary']
+    else:
+        active = next((key for key in allowed if checks.get(key)),None)
+    return active, failures, successes
+
+
+def set_default(link):
+    call('ip','route','replace','blackhole','default','metric','41','proto',PROTO)
+    # Metric 40 is exclusively owned by E-DEV; no backup/unassigned main defaults are used.
+    if link:
+        call('ip','route','replace','default','via',link['gateway'],'dev',link['ifname'],
+             'onlink','metric','40','proto',PROTO)
+    else:
+        call('ip','route','del','default','metric','40','proto',PROTO,check=False)
+
+
+def runtime_refresh(reconnect=False):
+    runtime = runpy.run_path('/usr/local/sbin/e-dev-vpn')
+    mode = runtime['readmode']()
+    runtime['guard']('direct' if mode=='direct' else 'blocked')
+    runtime['routes'](mode)
+    selected = (B/'selected-profile').read_text().strip()
+    if reconnect and runtime['enabled']() and selected and (B/'profiles'/(selected+'.conf')).exists():
+        runtime['tunnel'](selected)
+    runtime['guard'](mode)
+
+
+def health(restore=False, reconnect=True):
+    if not (B/'lan.json').exists():
+        return
+    plan = config()
+    devices = inventory()
+    previous = read(STATE,{})
+    links = routing(plan,devices)
+    allowed = [plan['primary']]+(plan['backups'] if plan['failover'] else [])
+    checks = {key:probe(links[key]) for key in allowed}
+    active, failures, successes = choose(plan,previous,links,checks)
+    if restore and not active and links.get(plan['primary']):
+        active = plan['primary']
+    link = links.get(active)
+    signature = [active,link['ifname'],link['address'],link['gateway']] if link else None
+    changed = signature!=previous.get('signature')
+    set_default(link)
+    if changed or restore:
+        for key,entry in plan['inputs'].items():
+            priority = '-200' if key==active else '200'
+            call('nmcli','connection','modify',entry['profile'],'ipv4.dns-priority',priority,check=False)
+            name = resolve(entry,devices)
+            if name and links[key]:
+                call('nmcli','device','reapply',name,check=False)
+        runtime_refresh(reconnect=changed and reconnect and link is not None)
+    save(STATE,dict(active=active,signature=signature,failures=failures,successes=successes,
+                    checks=checks,links=links,updated=time.time(),failover=plan['failover']))
+
+
+def profile_exists(name):
+    return call('nmcli','-g','connection.uuid','connection','show',name,check=False).returncode==0
+
+
+def set_password(profile, password):
+    # Persist a secret in a root-only NM keyfile, never in argv, public JSON or logs.
+    uuid = output('nmcli','-g','connection.uuid','connection','show',profile)
+    for path in KEYS.iterdir():
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(path)
+        if parser.get('connection','uuid',fallback='')!=uuid:
+            continue
+        if not parser.has_section('wifi-security'):
+            parser.add_section('wifi-security')
+        parser.set('wifi-security','psk',password.replace('\\','\\\\').replace(' ','\\s'))
+        parser.set('wifi-security','psk-flags','0')
+        temp = path.with_name(path.name+'.new')
+        fd = os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(fd,'w') as handle:
+            parser.write(handle)
+        temp.chmod(0o600)
+        temp.replace(path)
+        call('nmcli','connection','load',str(path))
+        return
+    raise ValueError('Не найден постоянный keyfile Wi-Fi профиля.')
+
+
+def configure_input(entry, devices):
+    profile = entry['profile']
+    if not profile_exists(profile):
+        args = ['nmcli','connection','add','type',entry['type'],'con-name',profile,'ifname','*']
+        if entry['type']=='wifi':
+            args += ['ssid',entry['ssid']]
+        call(*args)
+    properties = ['connection.interface-name','' if entry['id']!='eth0' else 'eth0',
+                  'connection.autoconnect','yes','connection.autoconnect-priority','200',
+                  'connection.autoconnect-retries','0','connection.controller','',
+                  'ipv4.method','auto' if entry['method']=='dhcp' else 'manual',
+                  'ipv4.addresses',entry['address'] if entry['method']=='static' else '',
+                  'ipv4.gateway',entry['gateway'] if entry['method']=='static' else '',
+                  'ipv4.dns',','.join(entry['dns']),'ipv4.ignore-auto-dns','yes','ipv4.routed-dns','no',
+                  'ipv4.route-table',str(entry['table']),'ipv4.never-default','no','ipv4.route-metric','100',
+                  'ipv6.never-default','yes']
+    if entry['id']!='eth0':
+        properties += ['ipv6.method','link-local']
+    if entry['type']=='wifi':
+        properties += ['wifi.mac-address',entry['mac'],'wifi.cloned-mac-address','permanent',
+                       'wifi.ssid',entry['ssid'],'wifi.mode','infrastructure','wifi-sec.key-mgmt',entry.get('security','wpa-psk')]
+        if entry.get('security')=='none':
+            properties += ['wifi-sec.psk','']
+    else:
+        properties += ['802-3-ethernet.mac-address',entry['mac']]
+    call('nmcli','connection','modify',profile,*properties)
+    if 'psk' in entry:
+        set_password(profile,entry['psk'])
+    name = resolve(entry,devices)
+    if name:
+        # A configured but absent/unauthenticated standby is saved for later autoconnect.
+        call('nmcli','--wait','15','connection','up',profile,'ifname',name,check=False,timeout=20)
+
+
+def configure_out(plan, devices, wifi):
+    # Converting an active Wi-Fi profile to a port can discard NM's cached secret.
+    # Capture it privately and persist it again after the conversion.
+    secrets = {}
+    for key,entry in plan['outputs'].items():
+        if entry['type']=='wifi':
+            source = entry['profile'] if profile_exists(entry['profile']) else 'E-DEV-AP'
+            secrets[key] = call('nmcli','--show-secrets','-g','802-11-wireless-security.psk','connection','show',source).stdout.rstrip('\n')
+            if len(secrets[key])<8:
+                raise ValueError('У точки доступа нет сохранённого пароля. e-dev passwd wifi')
+    # Finish the old radio DHCP server before moving its address to the bridge.
+    call('nmcli','connection','modify','E-DEV-AP','connection.autoconnect','no')
+    call('nmcli','--wait','20','connection','down','E-DEV-AP',check=False,timeout=25)
+    if profile_exists(BRIDGE_PROFILE):
+        call('nmcli','connection','modify',BRIDGE_PROFILE,'connection.autoconnect','no')
+        call('nmcli','--wait','20','connection','down',BRIDGE_PROFILE,check=False,timeout=25)
+    if not profile_exists(BRIDGE_PROFILE):
+        call('nmcli','connection','add','type','bridge','con-name',BRIDGE_PROFILE,'ifname',BRIDGE,
+             'connection.autoconnect','no','802-3-ethernet.cloned-mac-address',plan['outputs']['wlan0']['mac'])
+    call('nmcli','connection','modify',BRIDGE_PROFILE,'bridge.stp','yes','bridge.forward-delay','2',
+         'bridge.mac-address','','802-3-ethernet.cloned-mac-address',plan['outputs']['wlan0']['mac'],'connection.autoconnect','no',
+         'connection.autoconnect-ports','1','ipv4.method','shared','ipv4.addresses',wifi['address'],
+         'ipv4.shared-dhcp-range',wifi['dhcp_range'],'ipv4.shared-dhcp-lease-time',str(wifi['lease']),
+         'ipv4.never-default','yes','ipv6.method','disabled')
+    for key,entry in plan['outputs'].items():
+        if not profile_exists(entry['profile']):
+            if entry['type']=='wifi':
+                call('nmcli','connection','clone','E-DEV-AP',entry['profile'])
+            else:
+                call('nmcli','connection','add','type','ethernet','con-name',entry['profile'],'ifname','*')
+        # NM drops a port's IP settings when it becomes a bridge port.
+        # ipv4/ipv6 properties are then invalid on the port profile.
+        props = ['connection.interface-name','wlan0' if key=='wlan0' else '',
+                 'connection.controller',BRIDGE,'connection.port-type','bridge',
+                 'connection.autoconnect','yes','connection.autoconnect-priority','200']
+        props += ['wifi.mac-address',entry['mac'],'wifi.cloned-mac-address','permanent'] if entry['type']=='wifi' else ['802-3-ethernet.mac-address',entry['mac']]
+        call('nmcli','connection','modify',entry['profile'],*props)
+        if entry['type']=='wifi':
+            set_password(entry['profile'],secrets[key])
+    call('nmcli','connection','modify',BRIDGE_PROFILE,'connection.autoconnect','yes')
+    call('nmcli','--wait','30','connection','up',BRIDGE_PROFILE)
+    for key,entry in plan['outputs'].items():
+        name = resolve(entry,devices)
+        if name:
+            call('nmcli','--wait','15','connection','up',entry['profile'],'ifname',name,
+                 check=key=='wlan0',timeout=20)
+    save(B/'wifi.json',dict(wifi,interface=BRIDGE))
+
+
+def block_outputs():
+    exists = call('nft','list','table','inet','e_dev_lan_change',check=False).returncode==0
+    call('nft','-f','-',input=('delete table inet e_dev_lan_change\n' if exists else '')+'''table inet e_dev_lan_change {
+ chain forward { type filter hook forward priority -20; policy accept;
+  iifname { "wlan0", "edevbr0" } counter drop
+ }
+}
+''')
+
+
+def unblock_outputs():
+    call('nft','delete','table','inet','e_dev_lan_change')
+
+
+def verify_output(device, address):
+    if address not in read_addresses().get(device,[]):
+        raise ValueError('OUT не получил ожидаемый адрес: '+device)
+    if device==BRIDGE:
+        links = json.loads(output('ip','-j','link'))
+        bridge = next((row['ifindex'] for row in links if row['ifname']==BRIDGE),None)
+        master = next((row.get('master') for row in links if row['ifname']=='wlan0'),None)
+        if master not in (BRIDGE,bridge) or bridge is None:
+            raise ValueError('Встроенная точка wlan0 не включена в мост OUT.')
+
+
+def verify_active(active, devices):
+    physical = {d['ifname'] for d in devices}|{BRIDGE}
+    for row in active:
+        uuid,_,name = row.partition(':')
+        if name in physical and output('nmcli','-g','GENERAL.CON-UUID','device','show',name)!=uuid:
+            raise ValueError('Не восстановлено прежнее подключение: '+name)
+
+
+def wait_output(device,address,timeout=40):
+    deadline = time.monotonic()+timeout
+    while True:
+        try:
+            return verify_output(device,address)
+        except ValueError:
+            if time.monotonic()>=deadline:
+                raise
+            time.sleep(0.5)
+
+
+def input_snapshot(plan):
+    snapshots = []
+    # eth0 may be an in-memory generated NM connection with no backing keyfile.
+    # Preserve every property this controller changes, in addition to keyfiles.
+    common = ['connection.interface-name','connection.autoconnect','connection.autoconnect-priority',
+              'connection.autoconnect-retries','connection.controller','ipv4.method','ipv4.addresses',
+              'ipv4.gateway','ipv4.dns','ipv4.ignore-auto-dns','ipv4.routed-dns','ipv4.route-table',
+              'ipv4.never-default','ipv4.route-metric','ipv4.dns-priority','ipv6.never-default']
+    for entry in plan['inputs'].values():
+        if not profile_exists(entry['profile']):
+            continue
+        fields = common+(['802-3-ethernet.mac-address'] if entry['type']=='ethernet' else
+                         ['ipv6.method','802-11-wireless.mac-address','802-11-wireless.cloned-mac-address','802-11-wireless.ssid','802-11-wireless.mode','802-11-wireless-security.key-mgmt'])
+        values = call('nmcli','--escape','no','-g',','.join(fields),'connection','show',entry['profile']).stdout.splitlines()
+        if len(values)!=len(fields):
+            raise ValueError('Не удалось сохранить прежние настройки IN.')
+        snapshots.append(dict(profile=entry['profile'],properties=dict(zip(fields,values))))
+    return snapshots
+
+
+def apply():
+    with lock('e-dev-wifi'), lock('e-dev-policy'), lock('e-dev-vpn'):
+        plan = validate(read(REQUEST))
+        devices = inventory()
+        old = read(B/'lan.json')
+        wifi_controller = runpy.run_path('/usr/local/sbin/e-dev-wifi')
+        wifi = wifi_controller['current']()
+        backup = BACKUPS/('lan-'+str(time.time_ns()))
+        backup.mkdir(parents=True,mode=0o700)
+        shutil.copytree(KEYS,backup/'connections')
+        files = [B/'lan.json',B/'wifi.json',B/'dns.conf',STATE,SAMBA]
+        snapshot = {str(path):path.read_text() if path.exists() else None for path in files}
+        active = output('nmcli','-t','-f','UUID,DEVICE','connection','show','--active').splitlines()
+        inputs = input_snapshot(old or plan)
+        save(backup/'snapshot.json',dict(files=snapshot,active=active,inputs=inputs),0o600)
+        for path in backup.rglob('*'):
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        block_outputs()
+        try:
+            kept = {entry['profile'] for zone in ('inputs','outputs') for entry in plan[zone].values()}
+            if old:
+                for zone in ('inputs','outputs'):
+                    for entry in old[zone].values():
+                        if entry['profile'] not in kept and entry['id'] not in ('eth0','wlan0'):
+                            call('nmcli','connection','delete',entry['profile'],check=False)
+            for entry in plan['inputs'].values():
+                previous = old['inputs'].get(entry['id']) if old else None
+                if previous!=entry:
+                    configure_input(entry,devices)
+            if not old or old['outputs']!=plan['outputs']:
+                configure_out(plan,devices,wifi)
+            wait_output(BRIDGE,wifi['address'])
+            save(B/'lan.json',public(plan))
+            wifi_controller['dns_address'](wifi['address'])
+            health(restore=True)
+            call('systemctl','restart','e-dev-dns')
+            SAMBA.write_text(re.sub(r'(?m)^\s*interfaces\s*=.*$', ' interfaces = lo eth* en* wl* edevbr0',SAMBA.read_text()))
+            call('testparm','-s')
+            call('systemctl','restart','smbd')
+            unblock_outputs()
+            save(RESULT,dict(success=True,updated=time.time(),backup=str(backup)))
+        except Exception as error:
+            recovered = False
+            try:
+                for name in output('nmcli','-t','-f','NAME','connection','show').splitlines():
+                    if name.startswith(('E-DEV-IN-usb-','E-DEV-OUT-','E-DEV-OUT')):
+                        call('nmcli','connection','delete',name,check=False)
+                shutil.copytree(backup/'connections',KEYS,dirs_exist_ok=True)
+                for name,content in snapshot.items():
+                    path = P.Path(name)
+                    if content is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_text(content)
+                call('nmcli','connection','reload')
+                for entry in inputs:
+                    properties = [value for pair in entry['properties'].items() for value in pair]
+                    call('nmcli','connection','modify',entry['profile'],*properties)
+                for row in sorted(active,key=lambda row:row.endswith(':'+BRIDGE),reverse=True):
+                    uuid,_,name = row.partition(':')
+                    if name==BRIDGE or any(d['ifname']==name for d in devices):
+                        call('nmcli','--wait','20','connection','up','uuid',uuid,'ifname',name,check=False,timeout=25)
+                verify_active(active,devices)
+                previous_wifi = json.loads(snapshot[str(B/'wifi.json')] or '{}')
+                wait_output(BRIDGE if previous_wifi.get('interface')==BRIDGE else 'wlan0',wifi['address'])
+                if old:
+                    health(restore=True)
+                else:
+                    for row in json.loads(output('ip','-j','rule')):
+                        if 10000<=row.get('priority',0)<10200:
+                            delete_rules(row['priority'])
+                    call('ip','route','flush','table','main','proto',PROTO,check=False)
+                    runtime_refresh(reconnect=True)
+                call('systemctl','restart','e-dev-dns','smbd')
+                unblock_outputs()
+                recovered = True
+            finally:
+                save(RESULT,dict(success=False,recovered=recovered,error=str(error)[:500],
+                                 updated=time.time(),backup=str(backup)))
+            raise
+        finally:
+            REQUEST.unlink(missing_ok=True)
+
+
+def queue(plan):
+    plan = validate(plan)
+    with lock('e-dev-wifi'):
+        for unit in ('e-dev-lan-apply.service','e-dev-wifi-apply.service'):
+            if output('systemctl','show','-p','ActiveState','--value',unit) in ('active','activating','deactivating'):
+                raise ValueError('Предыдущие сетевые изменения ещё применяются.')
+        save(REQUEST,plan,0o600)
+        try:
+            call('systemctl','start','--no-block','e-dev-lan-apply.service')
+        except Exception:
+            REQUEST.unlink(missing_ok=True)
+            raise
+
+
+def status():
+    plan = config()
+    devices = inventory()
+    state = read(STATE,{})
+    def name(key):
+        entry = plan['inputs'].get(key)
+        return (resolve(entry,devices) or entry['ifname']) if entry else 'нет'
+    print('IN · основной: '+name(plan['primary'])+' · резерв: '+(', '.join(name(key) for key in plan['backups']) or 'нет'))
+    print('Автопереключение: '+('ВКЛ' if plan['failover'] else 'ВЫКЛ')+' · активный: '+name(state.get('active')))
+    for zone,label in [('inputs','IN'),('outputs','OUT')]:
+        for key,entry in plan[zone].items():
+            name = resolve(entry,devices)
+            device = next((d for d in devices if d['ifname']==name),{})
+            detail = ', '.join(device.get('ips',[])) or ('порт '+BRIDGE if zone=='outputs' and name else 'без IPv4')
+            print(label+' · '+str(name or entry['ifname']+' (не подключён)')+' · '+entry['type']+' · '+detail)
+    print('OUT: '+BRIDGE+' · '+(', '.join(read_addresses().get(BRIDGE,[])) or 'без IPv4')+' · DHCP: e-dev wifi settings')
+    print('Настройки: e-dev lan setup')
+
+
+def main():
+    args = sys.argv[1:] or ['status']
+    if args==['status']:
+        return status()
+    if os.geteuid()!=0:
+        raise ValueError('Используйте e-dev lan setup / sudo.')
+    if args==['init']:
+        queue(config())
+        print('Сетевая конфигурация передана службе e-dev-lan-apply.')
+    elif args==['apply']:
+        apply()
+    elif args in (['health'],['restore'],['check']):
+        with lock('e-dev-wifi'),lock('e-dev-policy'),lock('e-dev-vpn'):
+            health(restore=args==['restore'],reconnect=args!=['restore'])
+        if args==['check']:
+            status()
+    else:
+        raise ValueError('e-dev lan setup|status|check')
+
+
+if __name__=='__main__':
+    try:
+        main()
+    except (ValueError,OSError,KeyError,StopIteration,S.SubprocessError) as error:
+        print(str(error),file=sys.stderr)
+        sys.exit(1)

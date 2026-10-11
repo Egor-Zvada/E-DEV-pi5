@@ -18,7 +18,10 @@ def ips():
     try:
         return [(d['ifname'],a['local']) for d in json.loads(out(['ip','-j','-4','addr'])) for a in d.get('addr_info',[]) if a['scope']=='global']
     except Exception: return []
-def management_ips(): return [(n,a) for n,a in ips() if n.startswith(('eth','en','wl'))]
+def management_ips(): return [(n,a) for n,a in ips() if n.startswith(('eth','en','wl')) or n=='edevbr0']
+def out_device():
+    p=BASE/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
+    return 'edevbr0' if cfg.get('interface')=='edevbr0' else 'wlan0'
 def ap_address():
     p=BASE/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
     return str(ipaddress.IPv4Interface(cfg.get('address','10.42.0.1/24')).ip)
@@ -34,7 +37,7 @@ def status():
     return status_text()
 def status_text():
     print('E-DEV | мини dev-сервер')
-    print('Wi-Fi:',{'blocked':'выход закрыт','direct':'напрямую через провайдера','vpn':'через VPN','hybrid':'российские IP и исключения напрямую, остальные VPN'}.get(mode(),mode()))
+    print('Wi-Fi:',{'blocked':'BLOCKED','direct':'VPN OFF','vpn':'VPN ON','hybrid':'HYBRID'}.get(mode(),mode()))
     print('VPN-профиль:',selected())
     print('Выбор сервера:',vpn_config()['mode'].upper())
     print('Туннель:', 'интерфейс поднят' if P.Path('/sys/class/net/awg0').exists() else 'выключен / недоступен')
@@ -66,7 +69,7 @@ def help_(topic=None):
         print((DOC/'wiki'/'index.txt').read_text()); return
     if topic=='all': path=DOC/'E-DEV-guide.md'
     else:
-        if not re.fullmatch('[a-z]+',topic): fail('e-dev help vpn|wifi|panels|files|passwd|containers|troubleshoot|all')
+        if not re.fullmatch('[a-z]+',topic): fail('e-dev help vpn|wifi|lan|panels|files|passwd|containers|troubleshoot|all')
         path=DOC/'wiki'/(topic+'.txt')
     if not path.exists(): fail('Нет такого раздела. e-dev help')
     if sys.stdout.isatty(): run(['less','-R',str(path)])
@@ -265,7 +268,7 @@ def wifi_status():
     print('VPN-туннель: '+('ВКЛЮЧЁН' if on else 'ВЫКЛЮЧЕН')+'; интерфейс '+('поднят' if iface else 'отсутствует'))
     print('VPN-сервер: '+selected()+'; выбор: '+policy['mode'].upper())
     if policy['mode']=='default': print('Основной: '+str(policy.get('primary') or '—')+'; резерв: '+str(policy.get('backup') or '—'))
-    print('Адрес AP: '+next((a for n,a in ips() if n=='wlan0'),'нет IPv4')+' · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
+    print('Адрес OUT: '+next((a for n,a in ips() if n==out_device()),'нет IPv4')+' · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
     if mode()!='direct' and not (on and iface): print('VPN-выход закрыт. Для прямого выхода AP: e-dev wifi vpn off')
 
 def wifi_clients():
@@ -273,14 +276,14 @@ def wifi_clients():
     result=run(['iw','dev','wlan0','station','dump'],stdout=sp.PIPE,stderr=sp.PIPE)
     if result.returncode: fail('Не удалось прочитать клиентов AP: '+result.stderr.strip())
     leases={}
-    lease=P.Path('/var/lib/NetworkManager/dnsmasq-wlan0.leases')
+    lease=P.Path('/var/lib/NetworkManager')/('dnsmasq-'+out_device()+'.leases')
     if lease.exists():
         for line in lease.read_text().splitlines():
             fields=line.split()
             if len(fields)>=4: leases[fields[1].lower()]=(fields[2],fields[3])
     neighbors={}
     try:
-        for entry in json.loads(out(['ip','-j','-4','neigh','show','dev','wlan0']) or '[]'):
+        for entry in json.loads(out(['ip','-j','-4','neigh','show','dev',out_device()]) or '[]'):
             if entry.get('lladdr'): neighbors[entry['lladdr'].lower()]=entry['dst']
     except ValueError: pass
     stations=[]
@@ -297,7 +300,7 @@ def wifi_clients():
     print('Подключено к E-DEV: '+str(len(stations)))
     old=[(mac,addr,name) for mac,(addr,name) in leases.items() if mac not in stations]
     if old:
-        print('\nDHCP-записи без текущего подключения (не входят в счётчик):')
+        print('\nDHCP-записи без текущего Wi-Fi-подключения (не входят в счётчик):')
         for mac,addr,name in old: print(f'  {addr:16} {mac}  '+('—' if name=='*' else name))
 
 def main():
@@ -312,6 +315,10 @@ def main():
     elif cmd=='welcome': welcome()
     elif cmd=='wvpn': wvpn(args[1:])
     elif cmd=='vpn': vpn(args[1:])
+    elif cmd=='lan':
+        sub=args[1].lower() if len(args)>1 else 'status'
+        if sub!='status': root()
+        sys.exit(run(['/usr/local/sbin/e-dev-lan-ui'] if sub=='setup' else ['/usr/local/sbin/e-dev-lan']+[sub]).returncode)
     elif cmd=='speedtest': vpn(['speedtest'])
     elif cmd=='passwd': password(args[1].lower() if len(args)>1 else 'all')
     elif cmd=='containers': run(['incus','list'])

@@ -1,6 +1,6 @@
 [Unit]
 Description=E-DEV selected AmneziaWG and policy routing
-After=NetworkManager.service incus.service e-dev-guard.service network-online.target
+After=NetworkManager.service incus.service e-dev-guard.service network-online.target e-dev-network.service
 Wants=network-online.target
 
 [Service]

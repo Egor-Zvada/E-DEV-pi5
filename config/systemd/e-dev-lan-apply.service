@@ -1,0 +1,8 @@
+[Unit]
+Description=E-DEV IN/OUT network configuration transaction
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-lan apply
+TimeoutStartSec=5min

@@ -11,6 +11,7 @@ sections={'index': 'E-DEV — справочник домашнего серве
           '  e-dev wifi clients           число клиентов Wi-Fi, IP и MAC\n'
           '  e-dev wifi status             точка, режим трафика, VPN-сервер\n'
           '  e-dev wifi settings          меню подсети AP и DHCP\n'
+          '  e-dev lan setup              меню IN/OUT и резервных входов\n'
           '  e-dev vpn on|off|status       включение и выключение самого туннеля\n'
           '  e-dev vpn settings           меню выбора default / manual / auto\n'
           '  e-dev vpn manual             меню выбора одного сервера\n'
@@ -23,20 +24,14 @@ sections={'index': 'E-DEV — справочник домашнего серве
           'Разделы (стрелки / PgUp / PgDn, /поиск, q — выход):\n'
           '  e-dev help vpn               туннель, Auto и управление профилями\n'
           '  e-dev help wifi              режимы AP, гибрид, IP-база, клиенты\n'
+          '  e-dev help lan               интерфейсы, мост OUT и резервирование\n'
           '  e-dev help panels            LXConsole и Incus UI\n'
           '  e-dev help files             файлы с Mac/iPhone\n'
           '  e-dev help passwd            смена паролей\n'
           '  e-dev help containers        прямые и VPN-контейнеры, ARM/x86\n'
           '  e-dev help troubleshoot      диагностика\n'
           '  e-dev help all               вся инструкция\n'
-          '  man e-dev                    системная man-страница\n'
-          '\n'
-          'Tab дополняет команды, имена профилей, контейнеры и пути конфигов.\n'
-          'Имена команды: e-dev, E-DEV, E-dev, edev. e-d + Tab → e-dev.\n'
-          'Дашборд status: ASCII-логотип, графики и режимы; показатели каждые 2 с.\n'
-          'q — выход, l — ссылки, r — обновить, p — пауза/продолжение бегущей строки.\n'
-          'Логотип: компактный от 80 столбцов, полный сбоку от 128×24.\n'
-          'wifi vpn on/off меняет маршрут AP, vpn on/off — сам туннель.\n',
+          '  man e-dev                    системная man-страница\n',
  'vpn': 'ТУННЕЛЬ И ОБЩИЙ ВЫБОР VPN-СЕРВЕРА\n'
         '\n'
         '  e-dev vpn status                  туннель, handshake, текущий режим выбора\n'
@@ -185,16 +180,8 @@ sections={'index': 'E-DEV — справочник домашнего серве
          'Если iPhone помнит предупреждение о WPA: забыть E-DEV, подключиться заново.\n'
          'Сейчас встроенный wlan0 раздаёт AP, интернет приходит через Ethernet.\n'
          '\n'
-         'После покупки USB-адаптера:\n'
-         '  nmcli device status\n'
-         '  iw dev\n'
-         '  sudo nmcli device wifi rescan ifname wlan1\n'
-         '  nmcli device wifi list ifname wlan1\n'
-         "  sudo nmcli --ask device wifi connect 'SSID' ifname wlan1 name uplink-wifi\n"
-         '\n'
-         'Имя USB-интерфейса проверить; оно может отличаться от wlan1.\n'
-         'Встроенный wlan0 оставляем для AP. Новый upstream получает маршрут хоста.\n'
-         'После смены upstream: e-dev vpn on (переподключить туннель).\n',
+         'USB-адаптеры и резервирование: e-dev lan setup / e-dev help lan.\n',
+ 'lan': 'СЕТЬ IN / OUT\n\n  e-dev lan setup     псевдографическое меню интерфейсов и резервирования\n  e-dev lan status    текущие зоны, активный вход и адреса\n  e-dev lan check     проверить разрешённые входы сейчас\n\nУправление: стрелки — выбрать, Enter — открыть, Space — отметить резервы,\nEsc — назад. Терминал минимум 60×20. Изменения подтверждаются перед применением.\n\nIN — источники интернета. eth0 закреплён в IN. USB Ethernet/Wi-Fi можно\nдобавить, выбрать DHCP или IPv4/маску/шлюз и DNS. Wi-Fi IN: список SSID,\nручной SSID, WPA2/WPA3/открытая сеть, скрытый ввод пароля.\nИнтерфейс подключается заранее, но не становится глобальным выходом,\nпока не выбран основным или разрешённым резервным. Его маршрут изолирован.\n\nOUT — общая локальная сеть на мосту edevbr0. Встроенный wlan0 закреплён\nв OUT. Дополнительные Ethernet-порты и Wi-Fi AP (если поддерживает драйвер)\nполучают тот же пул DHCP, доступ к панелям/SMB и режим VPN ON/OFF/HYBRID.\nАдрес и DHCP всего OUT: пункт меню OUT · подсеть и DHCP / e-dev wifi settings.\nWi-Fi адаптер в IN работает клиентом; в OUT — точкой, не клиентским мостом.\n\nРезервирование: отдельно выбрать основной, отметить резервные, задать\nпорядок и включить автопереход. По умолчанию резервов нет, автопереход ВЫКЛ.\nПроверяется HTTPS через каждый разрешённый вход. Три неудачи подряд —\nследующий доступный резерв; физическое исчезновение — немедленный переход.\nВозврат на основной после трёх успешных проверок. Проверки примерно каждые\n20–30 секунд; время зависит от количества интерфейсов и таймаутов.\nЕсли автопереход выключен, резервные не используются. Балансировки нет.\nПри потере всех разрешённых выходов неизвестный вход не подхватывается.\n\nВыбор VPN-сервера отдельный и общий для AP/контейнеров: e-dev vpn settings.\nПри смене IN туннель переподключается, его профиль/режим выбора сохраняется.\nРоли привязаны к постоянным MAC: смена USB-порта/имени не меняет назначение.\nНастройки живут на Pi, восстановление и проверки запускает systemd.\nПароли Wi-Fi IN только в root-only NetworkManager keyfile, не в справочнике.\n\nПрименение выполняет e-dev-lan-apply независимо от SSH. При ошибке — откат;\nесли откат не подтверждён, OUT-трафик закрыт. Исправить через Ethernet или\nлокальный монитор/клавиатуру. Снимки /opt/e-dev/backups/lan-* содержат секреты.\nЖурнал: sudo journalctl -u e-dev-lan-apply -u e-dev-network -u e-dev-uplink.\nДополнительные USB-адаптеры и реальный переход между ними проверяются\nпосле подключения оборудования; драйвер должен поддерживаться Pi OS.\n',
  'panels': 'ПАНЕЛИ\n'
            '\n'
            '  e-dev links                 актуальные IP и ссылки\n'
@@ -289,7 +276,7 @@ for name,text in sections.items(): (base/(name+'.txt')).write_text(text)
 manual='# E-DEV — справочник\n\n'+'\n\n'.join('## '+name+'\n\n```text\n'+text.rstrip()+'\n```' for name,text in sections.items())
 manual+='\n\nИсточники: [IPdeny](https://www.ipdeny.com/ipblocks/), [разбор на Хабре](https://habr.com/ru/companies/ruvds/articles/1004546/), [dnsmasq](https://dnsmasq.org/docs/dnsmasq-man.html), [официальный Ookla Speedtest CLI](https://www.speedtest.net/apps/cli).\n'
 (root/'docs/COMMANDS.md').write_text(manual)
-roff='.TH E-DEV 1 "" "E-DEV" "User Commands"\n.SH NAME\ne-dev \\- управление домашним сервером\n.SH SYNOPSIS\n.B e-dev help [vpn|wifi|panels|files|passwd|containers|troubleshoot|all]\n'
+roff='.TH E-DEV 1 "" "E-DEV" "User Commands"\n.SH NAME\ne-dev \\- управление домашним сервером\n.SH SYNOPSIS\n.B e-dev help [vpn|wifi|lan|panels|files|passwd|containers|troubleshoot|all]\n'
 for name,text in sections.items():
  roff+='\n.SH '+name.upper()+'\n.nf\n'+text.replace('\\','\\e').replace('-','\\-')+'\n.fi\n'
 (root/'docs/e-dev.1').write_text(roff)

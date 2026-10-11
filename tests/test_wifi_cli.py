@@ -29,7 +29,7 @@ class WifiTests(unittest.TestCase):
             self.assertIn('ВЫКЛЮЧЕН', output.getvalue())
             self.assertIn('VPN-сервер: main', output.getvalue())
             self.assertIn('Wi-Fi AP: ВКЛЮЧЕНА', output.getvalue())
-            self.assertIn('Адрес AP: 192.168.50.1', output.getvalue())
+            self.assertIn('Адрес OUT: 192.168.50.1', output.getvalue())
 
     def test_links_use_current_physical_interface_addresses_only(self):
         with patch.object(c, 'ips', return_value=[('eth0','192.168.55.8'),('wlan0','172.16.7.1'),('wlan1','192.168.60.8'),('awg0','10.8.0.2'),('incusbr0','10.158.92.1')]), contextlib.redirect_stdout(io.StringIO()) as output:
@@ -40,3 +40,10 @@ class WifiTests(unittest.TestCase):
         self.assertIn('smb://192.168.60.8/Share', links)
         for old in ('.local', '10.42.0.1', '10.8.0.2', '10.158.92.1'):
             self.assertNotIn(old, links)
+
+    def test_short_status_names_the_mode_without_routing_explanation(self):
+        for mode,expected in [('hybrid','HYBRID'),('vpn','VPN ON'),('direct','VPN OFF')]:
+            with patch.object(c,'mode',return_value=mode),patch.object(c,'selected',return_value='main'),patch.object(c,'vpn_config',return_value={'mode':'manual'}),patch.object(c,'out',return_value=''),patch.object(c,'management_ips',return_value=[]),contextlib.redirect_stdout(io.StringIO()) as output:
+                c.status_text()
+            self.assertIn('Wi-Fi: '+expected+'\n',output.getvalue())
+            self.assertNotIn('российские IP',output.getvalue())

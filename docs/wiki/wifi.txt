@@ -81,13 +81,4 @@ AP переподключится; клиенты получат новые ад
 Если iPhone помнит предупреждение о WPA: забыть E-DEV, подключиться заново.
 Сейчас встроенный wlan0 раздаёт AP, интернет приходит через Ethernet.
 
-После покупки USB-адаптера:
-  nmcli device status
-  iw dev
-  sudo nmcli device wifi rescan ifname wlan1
-  nmcli device wifi list ifname wlan1
-  sudo nmcli --ask device wifi connect 'SSID' ifname wlan1 name uplink-wifi
-
-Имя USB-интерфейса проверить; оно может отличаться от wlan1.
-Встроенный wlan0 оставляем для AP. Новый upstream получает маршрут хоста.
-После смены upstream: e-dev vpn on (переподключить туннель).
+USB-адаптеры и резервирование: e-dev lan setup / e-dev help lan.

@@ -16,8 +16,12 @@ cp -a /etc/bash_completion.d/e-dev "$BACKUP_DIR/completion"
 cp -a /usr/local/share/man/man1/e-dev.1 "$BACKUP_DIR/e-dev.1"
 chmod -R go-rwx "$BACKUP_DIR"
 bash "$REPO_DIR/scripts/deploy.sh"
+if ! command -v dialog >/dev/null || ! command -v ethtool >/dev/null; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y dialog ethtool
+fi
 python3 -m compileall -q /usr/local/bin/e-dev /usr/local/sbin/e-dev-*
 sysctl -p /etc/sysctl.d/90-e-dev-vpn.conf
 /usr/local/sbin/e-dev-vpn boot
-systemctl enable --now e-dev-vpn-health.timer e-dev-auto.timer
+systemctl enable --now e-dev-vpn-health.timer e-dev-auto.timer e-dev-network.service e-dev-uplink.timer
 printf 'Код обновлён. Резервная копия (содержит ключи, root-only): %s\n' "$BACKUP_DIR"

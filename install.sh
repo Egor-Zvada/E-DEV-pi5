@@ -14,7 +14,7 @@ apt-get update
 apt-get install -y ca-certificates curl git gnupg build-essential pkg-config golang-go \
     python3 python3-venv python3-dev libffi-dev libssl-dev openssl network-manager \
     dnsmasq-base nftables iproute2 iw wireless-regdb rfkill samba avahi-daemon \
-    bash-completion less man-db dnsutils apparmor uidmap
+    bash-completion less man-db dnsutils apparmor uidmap dialog ethtool
 install -d -m 755 /etc/apt/keyrings
 KEY_TMP=$(mktemp)
 trap 'rm -f "$KEY_TMP"' EXIT

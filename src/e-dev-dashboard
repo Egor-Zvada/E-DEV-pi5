@@ -89,6 +89,7 @@ class Sampler:
         self.cpu_history = collections.deque(maxlen=90)
         self.ram_history = collections.deque(maxlen=90)
         self.net_history = {name: collections.deque(maxlen=90) for name in INTERFACES}
+        self.interfaces = INTERFACES
         self.last_details = -float('inf')
         self.details = {}
 
@@ -103,7 +104,18 @@ class Sampler:
         fs = os.statvfs('/srv/share' if P.Path('/srv/share').exists() else '/')
         disk_total, disk_free = fs.f_blocks*fs.f_frsize, fs.f_bfree*fs.f_frsize
         net = {}
-        for name in INTERFACES:
+        lan = config('lan.json',{})
+        try:
+            uplink = json.loads(text('/run/e-dev-lan-state.json','{}'))
+        except ValueError:
+            uplink = {}
+        incoming = uplink.get('links',{}).get(uplink.get('active')) or {}
+        interfaces = (incoming.get('ifname','eth0'),'wlan0','awg0')
+        if interfaces!=self.interfaces:
+            self.previous_net.pop(interfaces[0],None)
+            self.net_history[interfaces[0]] = collections.deque(maxlen=90)
+            self.interfaces = interfaces
+        for name in interfaces:
             values = tuple(int(text('/sys/class/net/'+name+'/statistics/'+field, '0')) for field in ('rx_bytes', 'tx_bytes'))
             previous = self.previous_net.get(name, values)
             rates = [rate(a, b, now-self.previous_time) for a, b in zip(previous, values)]
@@ -122,6 +134,7 @@ class Sampler:
                     uptime=float(text('/proc/uptime', '0').split()[0]), net=net,
                     cpu_history=self.cpu_history, ram_history=self.ram_history,
                     net_history=self.net_history,
+                    interfaces=interfaces,lan=lan,uplink=uplink,
                     mode=text(BASE/'mode', 'vpn'), selected=text(BASE/'selected-profile', '—') or '—',
                     enabled=text(BASE/'vpn-enabled', 'on') == 'on',
                     tunnel=P.Path('/sys/class/net/awg0').exists(),
@@ -202,7 +215,7 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
     if page == 'links':
         canvas.put(3, 2, 'ПАНЕЛИ И ФАЙЛЫ', accent | curses.A_BOLD)
         addresses = [(name, addr) for name, addr in data.get('ips', {}).items()
-                     if name.startswith(('eth', 'en', 'wl')) and addr != '—']
+                     if (name.startswith(('eth', 'en', 'wl')) or name=='edevbr0') and addr != '—']
         visible = max(1, (height-6)//5)
         for index, (name, addr) in enumerate(addresses[:visible]):
             y = 4+index*5
@@ -263,16 +276,25 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         panel.put(10, half, 'Incus      '+containers, limit=right_width)
         clients = '—' if data['clients'] is None else str(data['clients'])
         panel.put(11, half, 'Wi-Fi      '+clients+' клиентов · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
+        if data.get('lan'):
+            active = data.get('uplink',{}).get('active')
+            entry = data['lan'].get('inputs',{}).get(active,{})
+            link = data.get('uplink',{}).get('links',{}).get(active) or {}
+            panel.put(12,half,'IN         '+link.get('ifname',entry.get('ifname','нет'))+
+                      (' · авто' if data['lan'].get('failover') else ' · без резерва'),limit=right_width)
         if height >= 24:
             row = 13
             panel.put(row, 2, 'СЕТЬ · RX ↓ / TX ↑', accent | curses.A_BOLD)
-            for index, name in enumerate(INTERFACES):
+            for index, name in enumerate(data.get('interfaces',INTERFACES)):
                 y = row+1+index*2
                 rx, tx = data['net'].get(name, (0, 0))
                 panel.put(y, 2, f'{name:5} ↓ {human_bytes(rx, "B/s")} ↑ {human_bytes(tx, "B/s")}', limit=half-4)
                 hist = data['net_history'][name]
                 panel.put(y, half, spark(hist, right_width, max(hist, default=1)), accent, right_width)
-                panel.put(y+1, 2, data.get('ips', {}).get(name, '—'))
+                address = data.get('ips',{}).get(name,'—')
+                if name=='wlan0' and data.get('ips',{}).get('edevbr0'):
+                    address = 'OUT '+data['ips']['edevbr0']+' · edevbr0'
+                panel.put(y+1, 2, address,limit=half-4)
         services = data.get('services', {})
         summary = '  '.join(label+' '+('●' if services.get(name) == 'active' else '○') for name, label in [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
         canvas.put(height-3, 2, summary, good)

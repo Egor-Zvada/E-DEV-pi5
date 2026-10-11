@@ -1,0 +1,13 @@
+[Unit]
+Description=E-DEV primary uplink and per-interface routing
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+Before=e-dev-vpn.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-lan restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

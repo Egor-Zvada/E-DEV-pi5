@@ -14,15 +14,18 @@ def readmode():
 def ap_interface():
  p=B/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
  return ipaddress.IPv4Interface(cfg.get('address','10.42.0.1/24'))
+def out_device():
+ p=B/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
+ return 'edevbr0' if cfg.get('interface')=='edevbr0' else 'wlan0'
 def local_routes():
  # AP comes from settings; the physical LAN comes from current kernel routes.
- routes=[(str(ap_interface().network),'wlan0'),('10.43.0.0/24','vpnbr0'),('10.158.92.0/24','incusbr0')]
+ routes=[(str(ap_interface().network),out_device()),('10.43.0.0/24','vpnbr0'),('10.158.92.0/24','incusbr0')]
  try:
   result=call('ip','-j','-4','route','show','table','main',check=False)
   for row in json.loads(result.stdout or '[]'):
    dev=row.get('dev','');dst=row.get('dst','default')
-   if row.get('scope')!='link' or row.get('protocol')!='kernel' or dst=='default': continue
-   if dev not in ('eth0','wlan0','vpnbr0','incusbr0') and not dev.startswith(('wl','en')): continue
+   if row.get('scope')!='link' or str(row.get('protocol')) not in ('kernel','241') or dst=='default': continue
+   if dev not in (out_device(),'vpnbr0','incusbr0') and not dev.startswith(('eth','wl','en')): continue
    net=str(ipaddress.IPv4Network(dst,strict=False))
    if (net,dev) not in routes: routes.append((net,dev))
  except (ValueError,OSError): pass
@@ -36,10 +39,10 @@ def rules(mode):
  dns=str(ap.ip)+':1053' if mode!='blocked' else '1.1.1.1'
  return '''table inet e_dev_guard {
  chain forward { type filter hook forward priority -10; policy accept;
-  iifname "wlan0" ip saddr != APNET counter drop
+  iifname "OUTDEV" ip saddr != APNET counter drop
   iifname "vpnbr0" ip saddr != 10.43.0.0/24 counter drop
   ip saddr NETS jump protect
-  iifname { "wlan0", "vpnbr0" } meta nfproto ipv6 drop
+  iifname { "OUTDEV", "vpnbr0" } meta nfproto ipv6 drop
  }
  chain protect { ALLOWED
   counter drop
@@ -55,7 +58,7 @@ def rules(mode):
  chain nat { type nat hook postrouting priority srcnat + 10; policy accept;
   ip saddr { APNET, 10.43.0.0/24 } oifname "awg0" masquerade
  }
-}'''.replace('DNSDEST',dns).replace('NETS',nets).replace('ALLOWED',allowed).replace('APNET',subnet)+'\n'
+}'''.replace('DNSDEST',dns).replace('NETS',nets).replace('ALLOWED',allowed).replace('APNET',subnet).replace('OUTDEV',out_device())+'\n'
 def geo_load():
  p=B/'ru4.zone'
  if not p.exists(): return

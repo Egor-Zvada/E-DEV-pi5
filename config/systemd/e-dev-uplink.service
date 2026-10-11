@@ -1,0 +1,8 @@
+[Unit]
+Description=E-DEV autonomous IN uplink checks and failover
+After=e-dev-network.service e-dev-vpn.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-lan health
+TimeoutStartSec=3min

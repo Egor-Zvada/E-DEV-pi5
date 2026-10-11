@@ -3,10 +3,11 @@ _e_dev_complete() {
  local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1],,}" sub="${COMP_WORDS[2],,}" third="${COMP_WORDS[3],,}" fourth="${COMP_WORDS[4],,}" fifth="${COMP_WORDS[5],,}" words=""
  COMPREPLY=()
  case "$COMP_CWORD" in
-  1) words="help man status links welcome wifi vpn speedtest passwd containers container docs" ;;
+  1) words="help man status links welcome wifi vpn lan speedtest passwd containers container docs" ;;
   2) case "$cmd" in
-      help|man) words="vpn wifi panels files passwd containers troubleshoot all" ;;
+      help|man) words="vpn wifi lan panels files passwd containers troubleshoot all" ;;
       vpn) words="status on off list settings default manual auto speeds selection speedtest use add remove rename" ;;
+      lan) words="setup status check" ;;
       wifi|wvpn) words="status settings vpn mode hybrid check update bypass clients" ;;
 
       passwd) words="all ssh files wifi ui" ;;

@@ -16,3 +16,4 @@ profiles/
 *.sqlite*
 *.db
 !config/*.conf
+!config/journald/*.conf

@@ -4,6 +4,7 @@ import collections
 import curses
 import datetime
 import json
+import math
 import os
 import pathlib as P
 import subprocess as S
@@ -43,7 +44,7 @@ def config(name, fallback):
 
 def command(args):
     try:
-        return S.run(args, text=True, capture_output=True, timeout=3).stdout.strip()
+        return S.run(args, text=True, capture_output=True, stdin=S.DEVNULL, timeout=3).stdout.strip()
     except (OSError, S.TimeoutExpired):
         return ''
 
@@ -52,6 +53,58 @@ def cpu_percent(before, after):
     total = sum(after)-sum(before)
     idle = (after[3]+after[4])-(before[3]+before[4])
     return max(0, min(100, 100*(total-idle)/total)) if total > 0 else 0
+
+
+def cpu_parts(before, after):
+    """User, nice, system, interrupt/steal; idle and iowait stay empty."""
+    if before is None:
+        return [0]*4
+    delta = [max(0, b-a) for a, b in zip(before, after)]
+    total = sum(delta)
+    return [100*v/total for v in (delta[0], delta[1], delta[2], sum(delta[5:8]))] if total else [0]*4
+
+
+def network_ceiling(values):
+    """A labelled 1/2/5 scale, in bytes/s; never a claimed link capacity."""
+    peak = max([125000, *values])  # At least 1 Mbit/s.
+    magnitude = 10**math.floor(math.log10(peak/125000))
+    for step in (1, 2, 5, 10):
+        ceiling = step*magnitude*125000
+        if ceiling >= peak:
+            return ceiling
+
+
+def mbps(value):
+    return f'{value*8/1e6:.2f} Mb/s'
+
+
+def memory_values(memory):
+    total = max(1, memory.get('MemTotal', 1))
+    available = min(total, max(0, memory.get('MemAvailable', memory.get('MemFree', 0))))
+    cache = max(0, memory.get('Cached', 0)+memory.get('SReclaimable', 0)+memory.get('Buffers', 0)-memory.get('Shmem', 0))
+    return total-available, total, min(available, cache)
+
+
+def resolve_zones(lan, uplink, devices):
+    """Use physical permanent MACs; bridge counters must never enter OUT totals."""
+    zones = {}
+    for zone, key, fallback in [('IN', 'inputs', 'eth0'), ('OUT', 'outputs', 'wlan0')]:
+        entries = lan.get(key) or {fallback: {'ifname': fallback}}
+        members = []
+        for ident, entry in entries.items():
+            match = next((d for d in devices if d.get('physical', True) and entry.get('mac') and entry['mac']==d.get('mac')), None)
+            # Without a configured permanent MAC (legacy), match the interface name.
+            if not entry.get('mac'):
+                match = next((d for d in devices if d.get('physical', True) and d['name']==entry['ifname']), None)
+            name = match['name'] if match else entry['ifname']
+            members.append(dict(name=name, present=match is not None, up=bool(match and match.get('up')),
+                                active=zone=='IN' and ident==uplink.get('active'),
+                                backup=zone=='IN' and ident in lan.get('backups', [])))
+        zones[zone] = members
+    vpn = next((d for d in devices if d['name']=='awg0'), None)
+    zones['VPN'] = [dict(name='awg0', present=vpn is not None, up=bool(vpn and vpn.get('up')),
+                         active=False, backup=False)]
+    return zones
 
 
 def rate(before, after, seconds):
@@ -71,6 +124,17 @@ def spark(values, width, ceiling=100):
     return ''.join(levels[min(7, max(0, int(v/ceiling*7)))] for v in list(values)[-max(1, width):])
 
 
+def plot_row(values, width, ceiling, row, height):
+    if height==1:
+        return spark(values, width, ceiling)
+    levels = '▁▂▃▄▅▆▇█'
+    result = ''
+    for value in list(values)[-max(1, width):]:
+        segment = min(1, max(0, value/max(ceiling, .001)*height-(height-row-1)))
+        result += levels[min(7, int(segment*7))] if segment>0 else ('·' if row==height-1 else ' ')
+    return result
+
+
 def marquee(message, width, elapsed):
     """Scroll a secondary status line; metric sampling stays independent."""
     if width <= 0:
@@ -84,23 +148,41 @@ def marquee(message, width, elapsed):
 class Sampler:
     def __init__(self):
         self.previous_cpu = None
+        self.previous_cores = {}
         self.previous_net = {}
         self.previous_time = time.monotonic()
         self.cpu_history = collections.deque(maxlen=90)
         self.ram_history = collections.deque(maxlen=90)
         self.net_history = {name: collections.deque(maxlen=90) for name in INTERFACES}
+        self.rx_history = {}
+        self.tx_history = {}
+        self.zone_history = {zone: (collections.deque(maxlen=90), collections.deque(maxlen=90))
+                             for zone in ('IN', 'OUT', 'VPN')}
+        self.zone_members = {}
         self.interfaces = INTERFACES
         self.last_details = -float('inf')
         self.details = {}
 
     def sample(self):
         now = time.monotonic()
-        counters = [int(v) for v in text('/proc/stat', 'cpu 0 0 0 0 0 0 0 0').splitlines()[0].split()[1:9]]
+        cpus = {row.split()[0]: [int(v) for v in row.split()[1:9]]
+                for row in text('/proc/stat', 'cpu 0 0 0 0 0 0 0 0').splitlines() if row.startswith('cpu')}
+        counters = cpus['cpu']
         cpu = cpu_percent(self.previous_cpu, counters) if self.previous_cpu else 0
+        parts = cpu_parts(self.previous_cpu, counters)
         self.previous_cpu = counters
+        cores = []
+        for name, values in cpus.items():
+            if name=='cpu':
+                continue
+            previous = self.previous_cores.get(name)
+            cores.append(dict(name=name, percent=cpu_percent(previous, values) if previous else 0,
+                              parts=cpu_parts(previous, values)))
+        self.previous_cores = {name: values for name, values in cpus.items() if name!='cpu'}
         memory = {row.split(':')[0]: int(row.split()[1])*1024 for row in text('/proc/meminfo').splitlines()}
-        total = memory.get('MemTotal', 1)
-        used = total-memory.get('MemAvailable', memory.get('MemFree', 0))
+        used, total, cache = memory_values(memory)
+        swap_total = memory.get('SwapTotal', 0)
+        swap_used = max(0, swap_total-memory.get('SwapFree', 0))
         fs = os.statvfs('/srv/share' if P.Path('/srv/share').exists() else '/')
         disk_total, disk_free = fs.f_blocks*fs.f_frsize, fs.f_bfree*fs.f_frsize
         net = {}
@@ -109,31 +191,48 @@ class Sampler:
             uplink = json.loads(text('/run/e-dev-lan-state.json','{}'))
         except ValueError:
             uplink = {}
-        incoming = uplink.get('links',{}).get(uplink.get('active')) or {}
-        interfaces = (incoming.get('ifname','eth0'),'wlan0','awg0')
-        if interfaces!=self.interfaces:
-            self.previous_net.pop(interfaces[0],None)
-            self.net_history[interfaces[0]] = collections.deque(maxlen=90)
-            self.interfaces = interfaces
+        if now-self.last_details >= 10:
+            self.refresh_details()
+            self.last_details = now
+        zones = resolve_zones(lan, uplink, self.details.get('devices', []))
+        interfaces = tuple(dict.fromkeys(m['name'] for members in zones.values() for m in members))
+        self.interfaces = interfaces
         for name in interfaces:
+            if not (P.Path('/sys/class/net')/name).exists():
+                self.previous_net.pop(name, None)
+                net[name] = (0, 0)
+                continue
             values = tuple(int(text('/sys/class/net/'+name+'/statistics/'+field, '0')) for field in ('rx_bytes', 'tx_bytes'))
             previous = self.previous_net.get(name, values)
             rates = [rate(a, b, now-self.previous_time) for a, b in zip(previous, values)]
             net[name] = rates
             self.previous_net[name] = values
-            self.net_history[name].append(sum(rates))
+            self.net_history.setdefault(name, collections.deque(maxlen=90)).append(sum(rates))
+            self.rx_history.setdefault(name, collections.deque(maxlen=90)).append(rates[0])
+            self.tx_history.setdefault(name, collections.deque(maxlen=90)).append(rates[1])
+        zone_net = {}
+        for zone, members in zones.items():
+            identity = tuple((m['name'], m['present']) for m in members)
+            if self.zone_members.get(zone)!=identity:
+                for history in self.zone_history[zone]:
+                    history.clear()
+                self.zone_members[zone] = identity
+            zone_net[zone] = tuple(sum(net.get(m['name'], (0, 0))[i] for m in members if m['present']) for i in (0, 1))
+            for history, value in zip(self.zone_history[zone], zone_net[zone]):
+                history.append(value)
         self.previous_time = now
         self.cpu_history.append(cpu)
         self.ram_history.append(100*used/total)
-        if now-self.last_details >= 10:
-            self.refresh_details()
-            self.last_details = now
-        return dict(self.details, cpu=cpu, mem_used=used, mem_total=total,
+        return dict(self.details, cpu=cpu, cpu_parts=parts, cores=cores,
+                    mem_used=used, mem_total=total, mem_cache=cache,
+                    swap_used=swap_used, swap_total=swap_total,
                     disk_used=disk_total-disk_free, disk_total=disk_total,
                     temperature=float(text('/sys/class/thermal/thermal_zone0/temp', '0'))/1000,
                     uptime=float(text('/proc/uptime', '0').split()[0]), net=net,
                     cpu_history=self.cpu_history, ram_history=self.ram_history,
                     net_history=self.net_history,
+                    rx_history=self.rx_history, tx_history=self.tx_history,
+                    zones=zones, zone_net=zone_net, zone_history=self.zone_history,
                     interfaces=interfaces,lan=lan,uplink=uplink,
                     mode=text(BASE/'mode', 'vpn'), selected=text(BASE/'selected-profile', '—') or '—',
                     enabled=text(BASE/'vpn-enabled', 'on') == 'on',
@@ -151,7 +250,7 @@ class Sampler:
         if os.geteuid() != 0:
             stations_args = ['sudo', '-n', *stations_args]
         try:
-            stations = S.run(stations_args, text=True, capture_output=True, timeout=3)
+            stations = S.run(stations_args, text=True, capture_output=True, stdin=S.DEVNULL, timeout=3)
             clients = stations.stdout.count('Station ') if stations.returncode == 0 else None
         except (OSError, S.TimeoutExpired):
             clients = None
@@ -166,8 +265,21 @@ class Sampler:
             ips = {d['ifname']: next((a['local'] for a in d.get('addr_info', []) if a['scope'] == 'global'), '—') for d in addresses}
         except (ValueError, TypeError, KeyError):
             ips = {}
+        devices = []
+        try:
+            for row in json.loads(command(['ip', '-j', 'link'])):
+                name = row['ifname']
+                physical = (P.Path('/sys/class/net')/name/'device').exists()
+                mac = row.get('permaddr', row.get('address', '')).lower()
+                if physical:
+                    permanent = command(['ethtool', '-P', name]).split()[-1:]
+                    if permanent and permanent[0]!='00:00:00:00:00:00':
+                        mac = permanent[0].lower()
+                devices.append(dict(name=name, mac=mac, physical=physical, up='UP' in row.get('flags', [])))
+        except (ValueError, TypeError, KeyError):
+            pass
         self.details = dict(services=services, ap=ap, clients=clients,
-                            running=running, containers=count, ips=ips)
+                            running=running, containers=count, ips=ips, devices=devices)
 
 
 class Canvas:
@@ -195,11 +307,103 @@ class Canvas:
         self.put(y, x, '━'*width, limit=width)
         self.put(y, x, '━'*filled, style, limit=width)
 
+    def meter(self, y, x, label, parts, value, width):
+        """htop-style coloured segments, with the readable value inside brackets."""
+        width = max(1, min(width, self.width-x-1))
+        prefix = label+' '
+        inner = width-len(prefix)-2
+        if inner < len(value)+2:
+            self.put(y, x, prefix+value, limit=width)
+            return
+        self.put(y, x, prefix+'['+' '*inner+']', curses.A_DIM, width)
+        start = x+len(prefix)+1
+        filled = 0
+        accumulated = 0
+        for percent, style in parts:
+            accumulated += max(0, percent)
+            end = min(inner, round(inner*min(100, accumulated)/100))
+            self.put(y, start+filled, '|'*(end-filled), style, end-filled)
+            filled = end
+        self.put(y, start+inner-len(value), value, curses.A_BOLD, len(value))
 
-def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animated=True):
+
+def draw_network(panel, data, start, stop, colors, scroll=0, detailed=True):
+    accent, good, warn = colors[:3]
+    cw = panel.width-4
+    zones = data.get('zones')
+    if zones is None:
+        names = data.get('interfaces', INTERFACES)
+        zones = {zone: [dict(name=names[index], present=True, up=True, active=index==0, backup=False)]
+                 for index, zone in enumerate(('IN', 'OUT', 'VPN'))}
+    room = max(0, stop-start)
+    member_count = sum(len(members) for members in zones.values())
+    graph_count = sum(bool(m['present'] and m.get('up', True)) for members in zones.values() for m in members)
+    plot_height = min(4, 1+max(0, room-2*len(zones)-member_count)//max(1, graph_count)) if detailed else 1
+    items = []
+    for zone, members in zones.items():
+        rates = data.get('zone_net', {}).get(zone)
+        if rates is None:
+            rates = tuple(sum(data['net'].get(m['name'], (0, 0))[i] for m in members if m['present']) for i in (0, 1))
+        history = data.get('zone_history', {}).get(zone)
+        values = [*history[0], *history[1]] if history else [*rates]
+        for member in members:
+            values.extend(data.get('rx_history', {}).get(member['name'], []))
+            values.extend(data.get('tx_history', {}).get(member['name'], []))
+        ceiling = network_ceiling(values)
+        active = next((m['name'] for m in members if m.get('active')), members[0]['name'] if members else 'нет')
+        if zone=='IN':
+            title = 'IN · '+active+' · '+data.get('ips', {}).get(active, 'без IPv4')
+        elif zone=='OUT':
+            bridge = 'edevbr0' if 'edevbr0' in data.get('ips', {}) else 'wlan0'
+            title = 'OUT · '+data.get('ips', {}).get(bridge, 'без IPv4')+' · '+{'vpn':'VPN ON','direct':'VPN OFF','hybrid':'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
+        else:
+            state = 'ВЫКЛ' if not data['enabled'] else 'ВКЛ' if data['tunnel'] else 'НЕТ ИНТЕРФЕЙСА'
+            title = 'ТУННЕЛЬ · awg0 · '+data['selected']+' · '+state
+        items.append(('heading', title, ceiling))
+        items.append(('meters', rates, ceiling))
+        if detailed:
+            for member in members:
+                rows = plot_height if member['present'] and member.get('up', True) else 1
+                for row in range(rows):
+                    items.append(('interface', (member, row, rows), ceiling))
+    maximum = max(0, len(items)-room)
+    scroll = max(0, min(scroll, maximum))
+    for index, item in enumerate(items[scroll:scroll+room], start):
+        kind, payload, ceiling = item
+        if kind=='heading':
+            scale = 'шкала '+mbps(ceiling)
+            panel.put(index, 2, payload, accent | curses.A_BOLD, max(0, cw-len(scale)-2))
+            panel.put(index, 2+cw-len(scale), scale, curses.A_DIM, len(scale))
+        elif kind=='meters':
+            half = cw//2
+            panel.meter(index, 2, 'RX', [(100*payload[0]/ceiling, accent)], mbps(payload[0]), half-1)
+            panel.meter(index, 2+half, 'TX', [(100*payload[1]/ceiling, good)], mbps(payload[1]), cw-half)
+        else:
+            member, row, rows = payload
+            name = member['name']
+            marker = '*' if member.get('active') else 'R' if member.get('backup') else ''
+            if row==0:
+                panel.put(index, 2, name+' '+marker, good if member.get('active') else accent, 12)
+            if not member['present'] or not member.get('up', True):
+                panel.put(index, 15, 'не подключён', warn)
+                continue
+            label_width = 16
+            gw = max(1, (cw-15-2*label_width)//2)
+            rx, tx = data['net'].get(name, (0, 0))
+            if row==0:
+                panel.put(index, 15, 'RX '+mbps(rx), accent, label_width-1)
+            panel.put(index, 15+label_width, plot_row(data.get('rx_history', {}).get(name, []), gw, ceiling, row, rows), accent, gw)
+            x = 17+label_width+gw
+            if row==0:
+                panel.put(index, x, 'TX '+mbps(tx), good, label_width-1)
+            panel.put(index, x+label_width, plot_row(data.get('tx_history', {}).get(name, []), gw, ceiling, row, rows), good, gw)
+    return scroll, maximum
+
+
+def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animated=True, network_scroll=0):
     canvas = Canvas(window)
     height, width = canvas.height, canvas.width
-    accent, good, warn = colors
+    accent, good, warn = colors[:3]
     window.erase()
     canvas.put(0, 2, 'E-DEV', accent | curses.A_BOLD)
     canvas.put(0, 10, 'Egor Zvada · egor-zvada.ru')
@@ -228,80 +432,90 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         elif len(addresses) > visible:
             canvas.put(height-2, 2, 'Все адреса: e-dev links')
     else:
-        # Keep all three network plots at their usual rows, even at 80x24.
-        wide_logo = bool(LOGO_SMALL) and width >= 128 and height >= 24
-        compact_logo = bool(LOGO_COMPACT) and width >= 80 and not wide_logo
+        full = height >= 24
+        wide_logo = bool(LOGO_SMALL) and width >= 128 and full
+        compact_logo = bool(LOGO_COMPACT) and width >= 80 and not wide_logo and full
         panel = Canvas(window, 44 if wide_logo else 0)
-        panel_width = panel.width
         if wide_logo:
             for index, line in enumerate(LOGO_SMALL):
                 canvas.put(3+index, 2, line, accent, 40)
         elif compact_logo:
             for index, line in enumerate(LOGO_COMPACT):
-                canvas.put(4+index, 2, line, accent, 12)
-        half = panel_width//2
+                canvas.put(3+index, 2, line, accent, 12)
         resource_x = 17 if compact_logo else 2
-        resource_width = half-resource_x-3
-        right_width = panel_width-half-3
-        panel.put(3, resource_x, 'РЕСУРСЫ', accent | curses.A_BOLD)
-        panel.put(3, half, 'РЕЖИМЫ', accent | curses.A_BOLD)
-        panel.put(4, resource_x, f"CPU  {data['cpu']:5.1f}%", limit=resource_width)
-        panel.bar(5, resource_x, data['cpu'], resource_width, accent)
-        panel.put(6, resource_x, spark(data['cpu_history'], resource_width), accent, resource_width)
-        mem = 100*data['mem_used']/max(1, data['mem_total'])
-        memory = ('RAM '+f"{data['mem_used']/2**30:.1f} / {data['mem_total']/2**30:.1f} GiB" if compact_logo
-                  else 'RAM  '+human_bytes(data['mem_used'])+' / '+human_bytes(data['mem_total']))
-        panel.put(7, resource_x, memory, limit=resource_width)
-        panel.bar(8, resource_x, mem, resource_width, accent)
-        panel.put(9, resource_x, spark(data['ram_history'], resource_width), accent, resource_width)
-        disk = (f"Диск {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f} GiB" if compact_logo
-                else 'Диск '+human_bytes(data['disk_used'])+' / '+human_bytes(data['disk_total']))
-        panel.put(10, resource_x, disk, limit=resource_width)
-        uptime = int(data['uptime'])
-        panel.put(11, resource_x, f"{data['temperature']:.1f} °C · {uptime//86400}д {(uptime//3600)%24}ч {(uptime//60)%60}м", limit=resource_width)
-        mode = {'vpn': 'VPN', 'direct': 'DIRECT', 'hybrid': 'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
-        panel.put(4, half, 'Wi-Fi AP   '+('ВКЛ' if data['ap'] else 'ВЫКЛ'), good if data['ap'] else warn, right_width)
-        panel.put(5, half, 'Трафик AP  '+mode, accent | curses.A_BOLD, right_width)
-        available = data['enabled'] and data['tunnel']
-        tunnel = 'ВКЛ · интерфейс поднят' if available else 'ВКЛ · нет интерфейса' if data['enabled'] else 'ВЫКЛ'
-        panel.put(6, half, 'Туннель    '+tunnel, good if available else warn, right_width)
-        panel.put(7, half, 'Сервер     '+data['selected'], limit=right_width)
-        policy = data['policy']
-        panel.put(8, half, 'Выбор      '+policy.get('mode', 'manual').upper(), limit=right_width)
-        if policy.get('mode') == 'default':
-            panel.put(9, half, str(policy.get('primary') or '—')+' → '+str(policy.get('backup') or 'без резерва'), limit=right_width)
+        mode_x = resource_x+(panel.width-resource_x-3)*55//100
+        resource_width = mode_x-resource_x-2
+        right_width = panel.width-mode_x-3
+        panel.put(2, resource_x, 'РЕСУРСЫ', accent | curses.A_BOLD)
+        panel.put(2, mode_x, 'РЕЖИМЫ', accent | curses.A_BOLD)
+        cpu_colors = (good, colors[4] if len(colors)>4 else accent,
+                      colors[3] if len(colors)>3 else warn, warn)
+        cores = data.get('cores') or [dict(name='cpu', percent=data['cpu'], parts=data.get('cpu_parts', [data['cpu']]))]
+        if full:
+            for index, core in enumerate(cores[:4]):
+                label = core['name'].replace('cpu', 'C') if core['name']!='cpu' else 'CPU'
+                panel.meter(3+index, resource_x, label, list(zip(core['parts'], cpu_colors)),
+                            f"{core['percent']:.1f}%", resource_width)
+            ram_row, swap_row, cpu_graph, ram_graph, info_row = 7, 8, 9, 10, 11
+            network_start = 12
         else:
-            panel.put(9, half, 'Контейнеры VPN: тот же сервер', limit=right_width)
-        containers = '—' if data['containers'] is None else str(data['running'])+' / '+str(data['containers'])+' запущено'
-        panel.put(10, half, 'Incus      '+containers, limit=right_width)
+            panel.meter(3, resource_x, 'CPU', list(zip(data.get('cpu_parts', [data['cpu']]), cpu_colors)),
+                        f"{data['cpu']:.1f}%", resource_width)
+            ram_row, swap_row, cpu_graph, ram_graph, info_row = 4, 5, 6, 7, None
+            network_start = 8
+        total = max(1, data['mem_total'])
+        ram_parts = [(100*data['mem_used']/total, good),
+                     (100*data.get('mem_cache', 0)/total, colors[4] if len(colors)>4 else accent)]
+        panel.meter(ram_row, resource_x, 'RAM', ram_parts,
+                    f"{data['mem_used']/2**30:.1f}/{total/2**30:.1f}G", resource_width)
+        swap_total = data.get('swap_total', 0)
+        swap_used = data.get('swap_used', 0)
+        panel.meter(swap_row, resource_x, 'Swp', [(100*swap_used/max(1, swap_total), warn)],
+                    f"{swap_used/2**30:.1f}/{swap_total/2**30:.1f}G" if swap_total else 'нет', resource_width)
+        panel.put(cpu_graph, resource_x, 'CPU ', curses.A_DIM, 4)
+        panel.put(cpu_graph, resource_x+4, spark(data['cpu_history'], resource_width-4), accent, resource_width-4)
+        panel.put(ram_graph, resource_x, 'RAM ', curses.A_DIM, 4)
+        panel.put(ram_graph, resource_x+4, spark(data['ram_history'], resource_width-4), good, resource_width-4)
+        uptime = int(data['uptime'])
+        if info_row is not None:
+            panel.put(info_row, resource_x, f"SD {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f}G · {data['temperature']:.0f}°C", limit=resource_width)
+        mode = {'vpn': 'VPN ON', 'direct': 'VPN OFF', 'hybrid': 'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
+        available = data['enabled'] and data['tunnel']
+        tunnel = 'ВКЛ · awg0' if available else 'ВКЛ · нет awg0' if data['enabled'] else 'ВЫКЛ'
+        active = data.get('uplink', {}).get('active')
+        active_link = data.get('uplink', {}).get('links', {}).get(active) or {}
+        active_name = active_link.get('ifname') or next((m['name'] for m in data.get('zones', {}).get('IN', []) if m.get('active')), 'eth0')
         clients = '—' if data['clients'] is None else str(data['clients'])
-        panel.put(11, half, 'Wi-Fi      '+clients+' клиентов · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
-        if data.get('lan'):
-            active = data.get('uplink',{}).get('active')
-            entry = data['lan'].get('inputs',{}).get(active,{})
-            link = data.get('uplink',{}).get('links',{}).get(active) or {}
-            panel.put(12,half,'IN         '+link.get('ifname',entry.get('ifname','нет'))+
-                      (' · авто' if data['lan'].get('failover') else ' · без резерва'),limit=right_width)
-        if height >= 24:
-            row = 13
-            panel.put(row, 2, 'СЕТЬ · RX ↓ / TX ↑', accent | curses.A_BOLD)
-            for index, name in enumerate(data.get('interfaces',INTERFACES)):
-                y = row+1+index*2
-                rx, tx = data['net'].get(name, (0, 0))
-                panel.put(y, 2, f'{name:5} ↓ {human_bytes(rx, "B/s")} ↑ {human_bytes(tx, "B/s")}', limit=half-4)
-                hist = data['net_history'][name]
-                panel.put(y, half, spark(hist, right_width, max(hist, default=1)), accent, right_width)
-                address = data.get('ips',{}).get(name,'—')
-                if name=='wlan0' and data.get('ips',{}).get('edevbr0'):
-                    address = 'OUT '+data['ips']['edevbr0']+' · edevbr0'
-                panel.put(y+1, 2, address,limit=half-4)
+        containers = '—' if data['containers'] is None else str(data['running'])+'/'+str(data['containers'])
+        policy = data['policy']
+        panel.put(3, mode_x, 'Wi-Fi AP   '+('ВКЛ' if data['ap'] else 'ВЫКЛ'), good if data['ap'] else warn, right_width)
+        panel.put(4, mode_x, 'Трафик AP  '+mode, accent | curses.A_BOLD, right_width)
+        if full:
+            panel.put(5, mode_x, 'Туннель    '+tunnel, good if available else warn, right_width)
+            panel.put(6, mode_x, data['selected']+' · '+policy.get('mode', 'manual').upper(), limit=right_width)
+            if policy.get('mode')=='default':
+                panel.put(7, mode_x, str(policy.get('primary') or '—')+' → '+str(policy.get('backup') or 'без резерва'), limit=right_width)
+            panel.put(8, mode_x, 'Wi-Fi '+clients+' · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
+            panel.put(9, mode_x, 'IN '+active_name+' · AUTO '+('ON' if data.get('lan', {}).get('failover') else 'OFF'), limit=right_width)
+            panel.put(10, mode_x, 'Incus '+containers+' запущено', limit=right_width)
+            panel.put(11, mode_x, f"Uptime {uptime//86400}д {(uptime//3600)%24}ч {(uptime//60)%60}м", limit=right_width)
+        else:
+            panel.put(5, mode_x, 'Туннель    '+tunnel, good if available else warn, right_width)
+            panel.put(6, mode_x, data['selected']+' · '+policy.get('mode', 'manual').upper(), limit=right_width)
+            panel.put(7, mode_x, 'IN '+active_name+' · Wi-Fi '+clients, limit=right_width)
+        network_scroll, maximum = draw_network(panel, data, network_start, height-3, colors,
+                                               network_scroll, detailed=full)
         services = data.get('services', {})
-        summary = '  '.join(label+' '+('●' if services.get(name) == 'active' else '○') for name, label in [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
+        summary = '  '.join(label+' '+('●' if services.get(name)=='active' else '○') for name, label in
+                            [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
+        if maximum:
+            summary += f'   сеть {network_scroll+1}/{maximum+1} · ↑↓/Pg'
         canvas.put(height-3, 2, summary, good)
-        ribbon = 'Egor Zvada · E-DEV · egor-zvada.ru    Контейнеры default → провайдер · vpn → выбранный туннель'
+        ribbon = 'Egor Zvada · E-DEV · egor-zvada.ru    RX/TX: относительно Pi · шкала авто по последним 3 мин'
         canvas.put(height-2, 2, marquee(ribbon, width-5, animation_time), accent, width-5)
     canvas.put(height-1, 2, 'q выход   l ссылки   r обновить   p '+('пауза строки' if animated else 'двигать строку')+' · 2 с', accent)
     window.refresh()
+    return network_scroll, maximum if page=='main' else 0
 
 
 def main(window):
@@ -313,9 +527,10 @@ def main(window):
     if curses.has_colors():
         curses.start_color()
         curses.use_default_colors()
-        for number, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW), 1):
+        for number, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                                              curses.COLOR_RED, curses.COLOR_BLUE), 1):
             curses.init_pair(number, foreground, -1)
-        colors = tuple(curses.color_pair(i) for i in (1, 2, 3))
+        colors = tuple(curses.color_pair(i) for i in (1, 2, 3, 4, 5))
     window.timeout(200)
     sampler = Sampler()
     page = 'main'
@@ -324,6 +539,7 @@ def main(window):
     animation_time = 0
     previous_frame = time.monotonic()
     animated = True
+    network_scroll = 0
     while True:
         now = time.monotonic()
         if animated:
@@ -332,7 +548,8 @@ def main(window):
         if now >= next_sample:
             data = sampler.sample()
             next_sample = time.monotonic()+2
-        render(window, data, page, colors, animation_time, animated)
+        position = render(window, data, page, colors, animation_time, animated, network_scroll)
+        network_scroll, maximum = position or (0, 0)
         key = window.getch()
         if key in (ord('q'), ord('Q'), 27):
             return
@@ -345,6 +562,18 @@ def main(window):
             next_sample = 0
         if key in (ord('p'), ord('P')):
             animated = not animated
+        if page=='main':
+            if key==curses.KEY_UP:
+                network_scroll = max(0, network_scroll-1)
+            if key==curses.KEY_DOWN:
+                network_scroll = min(maximum, network_scroll+1)
+            if key in (curses.KEY_NPAGE, curses.KEY_PPAGE):
+                step = max(1, window.getmaxyx()[0]-15)
+                network_scroll = max(0, min(maximum, network_scroll+(step if key==curses.KEY_NPAGE else -step)))
+            if key==curses.KEY_HOME:
+                network_scroll = 0
+            if key==curses.KEY_END:
+                network_scroll = maximum
 
 
 if __name__ == '__main__':

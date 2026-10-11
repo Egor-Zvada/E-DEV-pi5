@@ -453,15 +453,17 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         cores = data.get('cores') or [dict(name='cpu', percent=data['cpu'], parts=data.get('cpu_parts', [data['cpu']]))]
         if full:
             for index, core in enumerate(cores[:4]):
-                label = core['name'].replace('cpu', 'C') if core['name']!='cpu' else 'CPU'
+                label = core['name'].replace('cpu', 'CPU ') if core['name']!='cpu' else 'CPU all'
                 panel.meter(3+index, resource_x, label, list(zip(core['parts'], cpu_colors)),
                             f"{core['percent']:.1f}%", resource_width)
-            ram_row, swap_row, cpu_graph, ram_graph, info_row = 7, 8, 9, 10, 11
+            panel.meter(7, resource_x, 'CPU all', list(zip(data.get('cpu_parts', [data['cpu']]), cpu_colors)),
+                        f"{data['cpu']:.1f}%", resource_width)
+            ram_row, swap_row, cpu_graph, ram_graph = 8, 9, 10, 11
             network_start = 12
         else:
-            panel.meter(3, resource_x, 'CPU', list(zip(data.get('cpu_parts', [data['cpu']]), cpu_colors)),
+            panel.meter(3, resource_x, 'CPU all', list(zip(data.get('cpu_parts', [data['cpu']]), cpu_colors)),
                         f"{data['cpu']:.1f}%", resource_width)
-            ram_row, swap_row, cpu_graph, ram_graph, info_row = 4, 5, 6, 7, None
+            ram_row, swap_row, cpu_graph, ram_graph = 4, 5, 6, 7
             network_start = 8
         total = max(1, data['mem_total'])
         ram_parts = [(100*data['mem_used']/total, good),
@@ -477,8 +479,6 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         panel.put(ram_graph, resource_x, 'RAM ', curses.A_DIM, 4)
         panel.put(ram_graph, resource_x+4, spark(data['ram_history'], resource_width-4), good, resource_width-4)
         uptime = int(data['uptime'])
-        if info_row is not None:
-            panel.put(info_row, resource_x, f"SD {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f}G · {data['temperature']:.0f}°C", limit=resource_width)
         mode = {'vpn': 'VPN ON', 'direct': 'VPN OFF', 'hybrid': 'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
         available = data['enabled'] and data['tunnel']
         tunnel = 'ВКЛ · awg0' if available else 'ВКЛ · нет awg0' if data['enabled'] else 'ВЫКЛ'
@@ -508,6 +508,8 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         services = data.get('services', {})
         summary = '  '.join(label+' '+('●' if services.get(name)=='active' else '○') for name, label in
                             [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
+        if full:
+            summary += f"   SD {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f}G · {data['temperature']:.0f}°C"
         if maximum:
             summary += f'   сеть {network_scroll+1}/{maximum+1} · ↑↓/Pg'
         canvas.put(height-3, 2, summary, good)

@@ -73,12 +73,15 @@ class DashboardTests(unittest.TestCase):
                     for index, name in enumerate(d.INTERFACES):
                         self.assertIn(name, '\n'.join(window.row(row) for row in range(12, height-3)))
                     for index in range(4):
-                        self.assertIn('C'+str(index), window.row(3+index))
-                    self.assertIn('RAM', window.row(7))
-                    self.assertIn('1.0/4.0G', window.row(7))
-                    self.assertIn('Swp', window.row(8))
-                    self.assertIn('CPU', window.row(9))
-                    self.assertIn('RAM', window.row(10))
+                        self.assertIn('CPU '+str(index), window.row(3+index))
+                    self.assertIn('CPU all', window.row(7))
+                    self.assertIn('25.0%', window.row(7))
+                    self.assertIn('RAM', window.row(8))
+                    self.assertIn('1.0/4.0G', window.row(8))
+                    self.assertIn('Swp', window.row(9))
+                    self.assertIn('CPU', window.row(10))
+                    self.assertIn('RAM', window.row(11))
+                    self.assertIn('43°C', window.row(height-3))
                     self.assertIn('0.00 Mb/s', window.row(13))
                     self.assertIn('шкала', window.row(12))
                     if width >= 128:

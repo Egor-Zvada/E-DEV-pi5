@@ -1,31 +1,33 @@
 ДИАГНОСТИКА
 
-  e-dev status
-  e-dev vpn status
-  e-dev vpn speeds
+  e-dev status --once
+  e-dev lan status
+  e-dev wifi status
   e-dev wifi clients
-  e-dev wifi check DOMAIN/IP
-  e-dev wifi hybrid settings show
-  sudo systemctl list-timers 'e-dev-*'
-  sudo journalctl -u e-dev-vpn -u e-dev-dns -u e-dev-vpn-health -u e-dev-auto -n 50 --no-pager
+  e-dev vpn status
+  e-dev links
 
-Журнал сохраняется между загрузками: лимит 64 MiB, срок до 7 дней.
-После сбоя перезапуска: sudo journalctl -b -1 -n 100 --no-pager.
-Один успешный reboot не исключает повторения сбоя.
+Нет VPN-интернета: Settings → VPN → Состояние туннеля.
+Интерфейс awg0 не подтверждает связь; нужен свежий handshake.
+MANUAL сам не переключается; другой профиль выбрать в VPN → Выбор сервера.
+Туннель выключен: включить в VPN → Туннель или выбрать AP → VPN OFF.
 
-VPN-связь отсутствует: проверить upstream, handshake и vpn status.
-Manual не переключается сам; выберите другой через e-dev vpn manual.
-Default использует основной/резерв; Auto — результаты замеров и проверку связи.
-Сам Pi выходит напрямую. AP ON/HYBRID + VPN OFF: vpn on запускает туннель;
-wifi vpn off переводит только AP на прямой выход.
+Российский сервис не работает: AP → Hybrid Settings → Проверить маршрут,
+обновить IP-базу, добавить необходимые прямые домены/IP сервиса.
+DoH/Private Relay могут обходить доменные исключения.
 
-Сбой Auto/Speedtest: посмотреть vpn speeds и журнал e-dev-auto.
-Неудачный тест не разрешает прямой выход для VPN-трафика.
-Без интернета автообновление RU-базы не удаляет рабочий локальный кэш.
-Если российский сервис не работает, проверить его домены/IP, обновить
-IP-базу, при необходимости добавить вспомогательные адреса сервиса.
+Неудачный Speedtest: VPN → Измерения → Последние результаты AUTO;
+журнал e-dev-auto. Ошибка теста не включает прямой выход для VPN.
+После смены AP-пароля/SSID подключить клиентов с новыми настройками.
+После смены подсети смотреть e-dev links; старые IP-ссылки перестают работать.
 
-Обновления устройств Meta могут зависеть от доступности их сервисов.
-MSS AWG TCP ограничен 1360.
-Реальные приложения Ozon/WB/2ГИС, фото с iPhone и полный цикл питания
-проверяются на устройствах пользователя отдельно от маршрутизации.
+Журналы:
+  sudo journalctl -u e-dev-vpn -u e-dev-dns -u e-dev-vpn-health -n 80
+  sudo journalctl -u e-dev-lan-apply -u e-dev-network -u e-dev-uplink -n 80
+  sudo journalctl -u e-dev-wifi-apply -u e-dev-auto -n 80
+
+Прежний boot: sudo journalctl -b -1. Журнал сохраняется до 7 дней,
+лимит 64 MiB на диске и 16 MiB в RAM. Питание: vcgencmd get_throttled.
+Красный LED после сбоя reboot сам по себе не указывает причину.
+Драйверы USB, доступ конкретных приложений и аппаратное резервирование
+проверяются на реальном оборудовании отдельно от тестов кода.

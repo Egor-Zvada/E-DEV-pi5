@@ -19,41 +19,13 @@ lan = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.nam
 loader.exec_module(lan)
 
 
-class Dialog:
-    def run(self, title, kind, prompt, *items, initial=None):
-        size = shutil.get_terminal_size((80,24))
-        if size.columns<60 or size.lines<20:
-            raise ValueError('Для меню увеличьте терминал минимум до 60×20.')
-        height, width = min(22,size.lines-2), min(90,size.columns-4)
-        args = ['dialog','--stdout','--clear','--no-tags','--backtitle','Egor Zvada · E-DEV · egor-zvada.ru',
-                '--title',title,'--ok-label','ОК','--cancel-label','Назад','--yes-label','Да','--no-label','Нет',
-                kind,prompt,str(height),str(width)]
-        if kind in ('--menu','--checklist','--radiolist'):
-            args += [str(max(4,height-10))]+list(items)
-        elif kind=='--inputbox':
-            args += [initial or '']
-        result = S.run(args,text=True,stdout=S.PIPE)
-        return result.stdout.rstrip('\n') if result.returncode==0 else None
-
-    def menu(self,title,prompt,choices):
-        return self.run(title,'--menu',prompt,*[value for pair in choices for value in pair])
-
-    def input(self,title,prompt,initial=''):
-        return self.run(title,'--inputbox',prompt,initial=initial)
-
-    def message(self,title,prompt):
-        self.run(title,'--msgbox',prompt)
-
-    def yes(self,title,prompt):
-        return self.run(title,'--yesno',prompt) is not None
-
-    def checklist(self,title,prompt,choices,selected):
-        result = self.run(title,'--checklist',prompt,*[value for key,label in choices
-                         for value in (key,label,'on' if key in selected else 'off')])
-        if result is None:
-            return None
-        # Machine identifiers contain no spaces/quotes; dialog quotes each selected tag.
-        return [tag.strip('"') for tag in result.split()]
+path = P.Path('/usr/local/sbin/e-dev-tui')
+if not path.exists():
+    path = P.Path(__file__).with_name('e-dev-tui')
+loader = importlib.machinery.SourceFileLoader('tui_widgets', str(path))
+tui = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(tui)
+Dialog = tui.Dialog
 
 
 def label(key,entry,devices):
@@ -210,7 +182,7 @@ def interface_menu(ui,zone,key):
             ui.message('Интерфейс',label(key,entry,devices)+'\nMAC: '+entry['mac']+
                        '\nIP: '+(', '.join(device.get('ips',[])) or 'нет')+
                        ('\nРоль: '+role+'\nАктивный IN: '+name(plan,state.get('active'),devices) if zone=='inputs' else
-                        '\nIP/DHCP находятся на '+lan.BRIDGE+'; настройки: e-dev wifi settings'))
+                        '\nIP/DHCP находятся на '+lan.BRIDGE+'; настройки: e-dev settings → AP'))
         elif choice=='ip' and ip_settings(ui,entry):
             commit(ui,plan)
         elif choice=='wifi':
@@ -293,7 +265,7 @@ def dhcp_menu(ui):
     backend = runpy.run_path('/usr/local/sbin/e-dev-wifi')
     while True:
         data = backend['current']()
-        choice = ui.menu('OUT · подсеть и DHCP','Адрес: '+data['address']+'\nDHCP: '+(data['dhcp_range'] or 'автоматический')+'\nАренда: '+str(data['lease'] or 3600)+' с',
+        choice = ui.menu('AP · подсеть и DHCP','Адрес: '+data['address']+'\nDHCP: '+(data['dhcp_range'] or 'автоматический')+'\nАренда: '+str(data['lease'] or 3600)+' с',
                          [('address','Адрес Pi / подсеть'),('pool','Диапазон DHCP'),('lease','Срок аренды')])
         if choice is None:
             return
@@ -315,7 +287,7 @@ def dhcp_menu(ui):
         data = backend['validate'](data,backend['kernel_routes']())
         if not ui.yes('Применить OUT?', 'Адрес: '+data['address']+'\nDHCP: '+(data['dhcp_range'] or 'автоматический')+'\nАренда: '+str(data['lease'] or 3600)+' с\n\nКлиенты переподключатся. SSH через OUT может оборваться.'):
             continue
-        # Same detached transaction used by e-dev wifi settings.
+        # The detached AP transaction also handles the unified Settings UI.
         backend['queue'](data)
         ui.run('Применение','--infobox','Применяю подсеть и DHCP…')
         for _ in range(150):
@@ -327,55 +299,3 @@ def dhcp_menu(ui):
             time.sleep(1)
         else:
             ui.message('Применение продолжается','Журнал: journalctl -u e-dev-wifi-apply')
-
-
-def main():
-    if os.geteuid()!=0 or not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise ValueError('Откройте e-dev lan setup в терминале с sudo.')
-    if not shutil.which('dialog'):
-        raise ValueError('Нужен пакет dialog: sudo apt-get install dialog')
-    ui = Dialog()
-    if not (lan.B/'lan.json').exists():
-        if not commit(ui,lan.config()):
-            return
-    while True:
-        state = lan.read(lan.STATE,{})
-        choice = ui.menu('E-DEV · LAN setup','Активный IN: '+name(lan.config(),state.get('active'),lan.inventory())+'\nOUT: общий мост '+lan.BRIDGE,
-                         [('in','IN · источники интернета'),('out','OUT · Wi-Fi и проводные клиенты'),
-                          ('roles','Основной / резервные / автопереход'),('dhcp','OUT · подсеть и DHCP'),
-                          ('check','Проверить входы сейчас'),('status','Состояние всей сети')])
-        if choice is None:
-            return
-        try:
-            if choice in ('in','out'):
-                zone_menu(ui,'inputs' if choice=='in' else 'outputs')
-            elif choice=='roles':
-                roles(ui)
-            elif choice=='dhcp':
-                dhcp_menu(ui)
-            elif choice=='check':
-                ui.run('Проверка','--infobox','Проверяю доступ к интернету через разрешённые IN-интерфейсы…')
-                lan.call('systemctl','start','e-dev-uplink.service',timeout=150)
-                state = lan.read(lan.STATE,{})
-                plan,devices = lan.config(),lan.inventory()
-                rows = ['Активный IN: '+name(plan,state.get('active'),devices)]
-                for key,entry in plan['inputs'].items():
-                    check = state.get('checks',{}).get(key)
-                    rows.append(name(plan,key,devices)+' · '+('интернет доступен' if check else 'связь не подтверждена' if check is False else 'не участвует в резервировании'))
-                ui.message('Проверка','\n'.join(rows))
-            elif choice=='status':
-                ui.message('Сеть',review(lan.config())+'\n\nOUT IPv4: '+', '.join(lan.read_addresses().get(lan.BRIDGE,[])))
-        except (ValueError,OSError,S.SubprocessError) as error:
-            ui.message('Ошибка',str(error))
-
-
-if __name__=='__main__':
-    try:
-        main()
-    except (ValueError,OSError,S.SubprocessError) as error:
-        print(str(error),file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        S.run(['clear'])

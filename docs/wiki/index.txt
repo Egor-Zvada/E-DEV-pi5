@@ -1,30 +1,15 @@
-E-DEV — справочник домашнего сервера
+E-DEV 1.0 — домашний сервер
 Egor Zvada • E-DEV • egor-zvada.ru
 
-  e-dev status                 живой дашборд (q — выход, l — ссылки)
-  e-dev status --once          короткий текстовый статус
-  e-dev links                  актуальные панели и файлообмен
-  e-dev wifi clients           число клиентов Wi-Fi, IP и MAC
-  e-dev wifi status             точка, режим трафика, VPN-сервер
-  e-dev wifi settings          меню подсети AP и DHCP
-  e-dev lan setup              меню IN/OUT и резервных входов
-  e-dev vpn on|off|status       включение и выключение самого туннеля
-  e-dev vpn settings           меню выбора default / manual / auto
-  e-dev vpn manual             меню выбора одного сервера
-  e-dev vpn settings default   меню выбора основного и резерва
-  e-dev vpn auto               включить Auto и измерить профили
-  e-dev speedtest              скорость через активный VPN без переключения
-  e-dev wifi hybrid settings   меню настроек гибрида
-  e-dev passwd all             общий новый пароль сервисов
-
-Разделы (стрелки / PgUp / PgDn, /поиск, q — выход):
-  e-dev help vpn               туннель, Auto и управление профилями
-  e-dev help wifi              режимы AP, гибрид, IP-база, клиенты
-  e-dev help lan               интерфейсы, мост OUT и резервирование
-  e-dev help panels            LXConsole и Incus UI
-  e-dev help files             файлы с Mac/iPhone
-  e-dev help passwd            смена паролей
-  e-dev help containers        прямые и VPN-контейнеры, ARM/x86
-  e-dev help troubleshoot      диагностика
-  e-dev help all               вся инструкция
-  man e-dev                    системная man-страница
+  e-dev settings          настройки LAN, OUT, AP, VPN и доступа
+  e-dev status            живой дашборд
+  e-dev status --once     короткий текстовый статус
+  e-dev links             актуальные IP-ссылки на панели и файлы
+  e-dev wifi clients      подключённые Wi-Fi-клиенты, IP и MAC
+  e-dev wifi status       точка и режим трафика
+  e-dev lan status        входы интернета и OUT-порты
+  e-dev vpn status        туннель, профиль и handshake
+  e-dev speedtest         скорость активного VPN
+  e-dev passwd all        общий новый пароль SSH, UI, SMB и AP
+  e-dev manuals           инструкция по главам
+  man e-dev               системная man-страница

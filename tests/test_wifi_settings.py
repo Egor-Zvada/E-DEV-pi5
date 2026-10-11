@@ -18,6 +18,45 @@ class WifiSettingsTests(unittest.TestCase):
     def candidate(self):
         return dict(address='192.168.50.1/24', dhcp_range='192.168.50.100,192.168.50.200', lease=3600)
 
+    def test_radio_validation_and_secret_file_permissions(self):
+        data=dict(ssid='My AP',band='bg',channel=11,psk='test-passphrase')
+        candidate=dict(self.candidate(),radio=data)
+        self.assertEqual(w.validate(candidate,[]),candidate)
+        for change in (dict(ssid=''),dict(ssid='a'*33),dict(channel=36),dict(psk='short')):
+            with self.assertRaises(ValueError): w.validate_radio(dict(data,**change))
+        with tempfile.TemporaryDirectory() as temp:
+            path=pathlib.Path(temp)/'request.json'
+            w.save(path,candidate,0o600)
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+
+    def test_auto_channel_uses_empty_nmcli_value_on_apply_and_restore(self):
+        events=[]
+        def call(*args,**kw):
+            events.append(args)
+            if 'wifi.channel' in args:
+                self.assertEqual(args[args.index('wifi.channel')+1],'')
+            if '802-11-wireless.channel' in args:
+                self.assertEqual(args[args.index('802-11-wireless.channel')+1],'')
+            return 'test-passphrase' if '--show-secrets' in args else ''
+        with patch.object(w,'call',side_effect=call),patch.object(w,'radio_profiles',return_value=['AP']), \
+             patch.object(w.runpy,'run_path',return_value={'set_password':lambda *args:None}):
+            w.radio_modify(dict(ssid='AP',band='bg',channel=0))
+            w.radio_restore({'AP':dict(properties={'802-11-wireless.band':'bg','802-11-wireless.channel':'0'},psk='test-passphrase')})
+        self.assertNotIn('test-passphrase',str(events))
+
+    def test_failed_radio_change_restores_radio_password_and_system_settings(self):
+        with self.applying(fail_activations=1) as (base,request,old_dns,events):
+            system=base/'system.json';system.write_text('{"ssid":"old"}')
+            candidate=dict(self.candidate(),radio=dict(ssid='new',band='bg',channel=11))
+            w.REQUEST.write_text(json.dumps(candidate))
+            old_radio={'profile':{'psk':'test-passphrase','properties':{}}}
+            with patch.object(w,'radio_snapshot',return_value=old_radio),patch.object(w,'radio_modify'), \
+                 patch.object(w,'radio_restore') as restore,patch.object(w,'radio_activate'):
+                with self.assertRaises(subprocess.CalledProcessError): w.apply()
+            restore.assert_called_once_with(old_radio)
+            self.assertEqual(json.loads(system.read_text())['ssid'],'old')
+            self.assertIn(('unblock',),events)
+
     def test_subnet_rejects_lan_container_and_public_networks(self):
         data = self.candidate()
         self.assertEqual(w.validate(data, [{'dev':'wlan0','dst':'192.168.50.0/24'}]), data)

@@ -1,20 +1,17 @@
-КОНТЕЙНЕРЫ INCUS
+КОНТЕЙНЕРЫ И ARM / X86
 
-  e-dev containers
-  e-dev container start NAME
-  e-dev container stop NAME
+Контейнеры управляются через Incus UI, LXConsole или обычный incus CLI:
+  incus launch images:debian/13 demo --profile default
+  incus launch images:debian/13 demo-vpn --profile vpn
+  incus exec demo -- bash
 
-default: incusbr0, 10.158.92.0/24, напрямую.
-vpn: vpnbr0, 10.43.0.0/24, только через общий awg0.
-Default / Manual / Auto выбирают сервер одновременно для AP и этого
-профиля. Для контейнера vpn российские AP-исключения не действуют.
-VPN off закрывает VPN-контейнерам интернет. Wi-Fi VPN OFF (DIRECT) влияет только на AP.
-Локальные адреса доступны согласно локальным маршрутам.
+default — интернет через провайдера. vpn — целиком через общий VPN;
+выбранный в Settings профиль и DEFAULT/MANUAL/AUTO общие с AP.
+HYBRID действует только на OUT, VPN-контейнеры без прямых исключений.
+Профили по умолчанию: 1 GiB RAM и 2 CPU, storage dir для microSD.
+Публикация портов: proxy device Incus или маршрутизация к IP контейнера.
 
-Установщик не создаёт тестовые контейнеры.
-Лимит профилей по умолчанию 1 GiB RAM / 2 CPU; Pi имеет 4 GiB RAM.
-
-Перенос Pi ARM ↔ PVE x86: Git переносит исходники и конфигурацию,
-а контейнер создаётся под целевую архитектуру и пакеты собираются заново.
-Готовый ARM rootfs нельзя просто загрузить как x86 LXC.
-Реальный перенос проекта ещё не тестировался.
+Git переносит исходники и инструкции сборки между ARM Pi и x86 PVE.
+На другой архитектуре создать LXC и заново собрать/установить зависимости.
+ARM rootfs и ARM-бинарники не становятся x86 через Git.
+Сетевые профили Incus не переносятся автоматически в Proxmox.

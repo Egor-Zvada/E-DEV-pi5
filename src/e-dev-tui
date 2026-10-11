@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Shared dialog widgets and a local path picker with real Tab completion."""
+import curses
+import os
+import pathlib as P
+import pwd
+import shutil
+import subprocess as S
+
+BRAND = 'Egor Zvada · E-DEV · egor-zvada.ru'
+
+
+def home():
+    return P.Path(pwd.getpwnam(os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name).pw_dir)
+
+
+def expand_path(value):
+    if value == '~' or value.startswith('~/'):
+        return home()/value[2:] if value != '~' else home()
+    return P.Path(value).expanduser().absolute()
+
+
+def candidates(value):
+    path = expand_path(value)
+    directory = path if value.endswith('/') else path.parent
+    prefix = '' if value.endswith('/') else path.name
+    try:
+        entries = sorted((p for p in directory.iterdir() if p.name.startswith(prefix)),
+                         key=lambda p:(not p.is_dir(), p.name.casefold()))
+        return directory, entries
+    except OSError:
+        return directory, []
+
+
+def complete_path(value):
+    directory, entries = candidates(value)
+    if not entries:
+        return value
+    common = os.path.commonprefix([p.name for p in entries])
+    result = str(directory/common)
+    return result+'/' if len(entries)==1 and entries[0].is_dir() else result
+
+
+def pick_file(title, initial=None):
+    def screen(window):
+        curses.curs_set(0)
+        value = str(initial or home())+'/'
+        selected, choosing = 0, False
+        note = ''
+        while True:
+            height, width = window.getmaxyx()
+            window.erase()
+            def put(y, text, style=0):
+                if 0<=y<height:
+                    try: window.addstr(y, 2, text[:max(0,width-4)], style)
+                    except curses.error: pass
+            put(0, BRAND, curses.A_BOLD)
+            put(2, title+' · выбор файла', curses.A_BOLD)
+            put(4, 'Путь: '+value[-max(1,width-10):], curses.A_REVERSE if not choosing else 0)
+            put(5, 'Tab — дополнить · ↑↓ — файлы · Enter — открыть · Esc — назад')
+            directory, entries = candidates(value)
+            entries = [directory.parent]+entries
+            selected = min(selected, len(entries)-1)
+            count = max(1,height-10)
+            offset = max(0, selected-count+1)
+            for row, path in enumerate(entries[offset:offset+count], 7):
+                name = '..' if path==directory.parent else path.name+('/' if path.is_dir() else '')
+                put(row, name.replace('\n','?').replace('\r','?'), curses.A_REVERSE if choosing and row-7+offset==selected else 0)
+            put(height-2, note or 'Можно вставить полный путь. Ctrl-U — очистить; ← — удалить символ.')
+            window.refresh()
+            key = window.get_wch()
+            if key=='\x1b': return None
+            if key=='\t':
+                value = complete_path(value);selected=0;choosing=False
+            elif key in (curses.KEY_DOWN, curses.KEY_UP):
+                selected = max(0,min(len(entries)-1,selected+(1 if key==curses.KEY_DOWN else -1)))
+                choosing=True
+            elif key in ('\n','\r',curses.KEY_ENTER):
+                path = entries[selected] if choosing else expand_path(value)
+                if path.is_dir():
+                    value=str(path.resolve())+'/';selected=0;choosing=False
+                elif path.is_file(): return str(path.resolve())
+                else: note='Файл не найден.'
+            elif key in ('\x7f','\b',curses.KEY_BACKSPACE,curses.KEY_LEFT):
+                value=value[:-1];selected=0;choosing=False
+            elif key=='\x15': value='';selected=0;choosing=False
+            elif isinstance(key,str) and key.isprintable():
+                value+=key;selected=0;choosing=False;note=''
+    try:
+        return curses.wrapper(screen)
+    except KeyboardInterrupt:
+        return None
+
+
+class Dialog:
+    def run(self, title, kind, prompt, *items, initial=None):
+        size = shutil.get_terminal_size((80,24))
+        if size.columns<60 or size.lines<20:
+            raise ValueError('Для меню увеличьте терминал минимум до 60×20.')
+        height, width = min(30,size.lines-2), min(90,size.columns-4)
+        args = ['dialog','--stdout','--clear','--no-collapse','--no-tags','--backtitle',BRAND,
+                '--title',title,'--ok-label','ОК','--cancel-label','Выход' if title in ('E-DEV 1.0 · Settings','E-DEV · инструкция') else 'Назад','--yes-label','Да','--no-label','Нет']
+        if kind=='--yesno': args+=['--defaultno']
+        args += [kind,prompt,str(height),str(width)]
+        if kind in ('--menu','--checklist','--radiolist'):
+            lines=sum(max(1,(len(line)+width-9)//(width-8)) for line in prompt.splitlines())
+            args += [str(max(1,height-lines-8))]+list(items)
+        elif kind=='--inputbox': args += [initial or '']
+        result=S.run(args,text=True,stdout=S.PIPE)
+        if result.returncode not in (0,1,255):
+            raise ValueError('Не удалось открыть терминальное меню.')
+        return result.stdout.rstrip('\n') if result.returncode==0 else None
+
+    def menu(self,title,prompt,choices):
+        return self.run(title,'--menu',prompt,*[value for pair in choices for value in pair])
+    def input(self,title,prompt,initial=''):
+        return self.run(title,'--inputbox',prompt,initial=initial)
+    def password(self,title,prompt):
+        return self.run(title,'--passwordbox',prompt)
+    def message(self,title,prompt):
+        self.run(title,'--msgbox',prompt)
+    def yes(self,title,prompt):
+        return self.run(title,'--yesno',prompt) is not None
+    def checklist(self,title,prompt,choices,selected):
+        result=self.run(title,'--checklist',prompt,*[value for key,label in choices for value in (key,label,'on' if key in selected else 'off')])
+        return None if result is None else [tag.strip('"') for tag in result.split()]
+    def file(self,title): return pick_file(title)
+    def logo(self):
+        for root in (P.Path('/opt/e-dev/docs'),P.Path(__file__).resolve().parents[1]/'assets'):
+            path=root/'logo-dashboard.txt'
+            if path.exists():
+                width=min(90,shutil.get_terminal_size((80,24)).columns-4)-8
+                return '\n'.join(line.rstrip().center(width) for line in path.read_text().splitlines())
+        return BRAND

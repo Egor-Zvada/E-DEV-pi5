@@ -17,7 +17,7 @@ def enabled(): return not (B/'vpn-enabled').exists() or (B/'vpn-enabled').read_t
 def profiles(): return sorted(p.stem for p in (B/'profiles').glob('*.conf'))
 def alive(): return P.Path('/sys/class/net/awg0').exists()
 def valid(name):
- if name not in profiles(): raise ValueError('Нет профиля '+name+'. e-dev vpn list')
+ if name not in profiles(): raise ValueError('Нет профиля '+name+'. e-dev settings → VPN → Конфигурации')
 def switch(name):
  valid(name)
  result=run(R,'use',name,timeout=35)
@@ -84,14 +84,14 @@ def measure(name):
 
 def results():
  data=read('vpn-speeds.json',{})
- if not data: print('Замеров пока нет. e-dev vpn auto run');return
+ if not data: print('Замеров пока нет. e-dev settings → VPN → Измерения');return
  print('Последний замер: '+data.get('local_time','—'))
  for row in data.get('results',[]):
   print(row['name']+': '+(str(row['mbps'])+' Мбит/с ↓; '+str(row.get('upload_mbps','—'))+' Мбит/с ↑; ping '+str(row.get('ping_ms','—'))+' мс' if row['ok'] else row.get('error','недоступен')))
  print('Ookla Speedtest; выбор по download, при равенстве — меньший ping. Полный тест расходует трафик; результат относится к моменту замера.')
 
 def active_speedtest():
- if not enabled() or not alive(): raise ValueError('Активного VPN нет. e-dev vpn on')
+ if not enabled() or not alive(): raise ValueError('Активного VPN нет. e-dev settings → VPN → Туннель')
  name=selected();print('Speedtest через активный VPN '+name+'…',flush=True)
  row=measure(name)
  save('vpn-active-speed.json',{'local_time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'result':row})

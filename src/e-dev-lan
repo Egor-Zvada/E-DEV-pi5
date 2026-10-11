@@ -383,7 +383,7 @@ def configure_out(plan, devices, wifi):
             source = entry['profile'] if profile_exists(entry['profile']) else 'E-DEV-AP'
             secrets[key] = call('nmcli','--show-secrets','-g','802-11-wireless-security.psk','connection','show',source).stdout.rstrip('\n')
             if len(secrets[key])<8:
-                raise ValueError('У точки доступа нет сохранённого пароля. e-dev passwd wifi')
+                raise ValueError('У точки доступа нет сохранённого пароля. e-dev settings → AP → Wi-Fi')
     # Finish the old radio DHCP server before moving its address to the bridge.
     call('nmcli','connection','modify','E-DEV-AP','connection.autoconnect','no')
     call('nmcli','--wait','20','connection','down','E-DEV-AP',check=False,timeout=25)
@@ -525,7 +525,7 @@ def apply():
             call('systemctl','restart','e-dev-dns')
             SAMBA.write_text(re.sub(r'(?m)^\s*interfaces\s*=.*$', ' interfaces = lo eth* en* wl* edevbr0',SAMBA.read_text()))
             call('testparm','-s')
-            call('systemctl','restart','smbd')
+            call('systemctl','try-restart','smbd')
             unblock_outputs()
             save(RESULT,dict(success=True,updated=time.time(),backup=str(backup)))
         except Exception as error:
@@ -560,7 +560,8 @@ def apply():
                             delete_rules(row['priority'])
                     call('ip','route','flush','table','main','proto',PROTO,check=False)
                     runtime_refresh(reconnect=True)
-                call('systemctl','restart','e-dev-dns','smbd')
+                call('systemctl','restart','e-dev-dns')
+                call('systemctl','try-restart','smbd')
                 unblock_outputs()
                 recovered = True
             finally:
@@ -600,8 +601,8 @@ def status():
             device = next((d for d in devices if d['ifname']==name),{})
             detail = ', '.join(device.get('ips',[])) or ('порт '+BRIDGE if zone=='outputs' and name else 'без IPv4')
             print(label+' · '+str(name or entry['ifname']+' (не подключён)')+' · '+entry['type']+' · '+detail)
-    print('OUT: '+BRIDGE+' · '+(', '.join(read_addresses().get(BRIDGE,[])) or 'без IPv4')+' · DHCP: e-dev wifi settings')
-    print('Настройки: e-dev lan setup')
+    print('OUT: '+BRIDGE+' · '+(', '.join(read_addresses().get(BRIDGE,[])) or 'без IPv4')+' · DHCP: e-dev settings → AP')
+    print('Настройки: e-dev settings → LAN')
 
 
 def main():
@@ -609,7 +610,7 @@ def main():
     if args==['status']:
         return status()
     if os.geteuid()!=0:
-        raise ValueError('Используйте e-dev lan setup / sudo.')
+        raise ValueError('Откройте e-dev settings с sudo.')
     if args==['init']:
         queue(config())
         print('Сетевая конфигурация передана службе e-dev-lan-apply.')
@@ -621,7 +622,7 @@ def main():
         if args==['check']:
             status()
     else:
-        raise ValueError('e-dev lan setup|status|check')
+        raise ValueError('Настройки: e-dev settings → LAN')
 
 
 if __name__=='__main__':

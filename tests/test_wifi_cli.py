@@ -14,9 +14,18 @@ loader.exec_module(c)
 
 
 class WifiTests(unittest.TestCase):
-    def test_wifi_vpn_off_routes_ap_without_stopping_tunnel(self):
+    def test_partial_legacy_system_settings_keep_default_user_and_explicit_values(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(c,'BASE',pathlib.Path(tmp)):
+            system=pathlib.Path(tmp)/'system.json'
+            system.write_text('{"ssid":"My AP"}')
+            self.assertEqual(c.local_user(),'user')
+            self.assertEqual(c.system_config()['ssid'],'My AP')
+            system.write_text('{"user":"developer","ssid":"My AP"}')
+            self.assertEqual(c.local_user(),'developer')
+
+    def test_settings_route_off_does_not_stop_tunnel(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(c, 'PROFILES', pathlib.Path(tmp)), patch.object(c, 'root'), patch.object(c, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
-            with self.assertRaises(SystemExit): c.wvpn(['vpn','off'])
+            with self.assertRaises(SystemExit): c.wvpn(['off'])
         run.assert_called_once_with(['/usr/local/sbin/e-dev-vpn','off'])
 
     def test_wifi_status_shows_hybrid_even_if_tunnel_is_disabled(self):

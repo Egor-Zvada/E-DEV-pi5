@@ -4,7 +4,9 @@ import time, ipaddress, fcntl, contextlib
 import sys, os, subprocess as sp, pathlib as P, json, re, getpass, tempfile, shutil
 BASE=P.Path('/etc/e-dev'); DOC=P.Path('/opt/e-dev/docs'); STATE=BASE/'mode'; PROFILES=BASE/'profiles'
 def system_config():
-    p=BASE/'system.json';return json.loads(p.read_text()) if p.exists() else {'user':'user','hostname':'E-DEV','ssid':'E-DEV'}
+    p=BASE/'system.json'
+    defaults={'user':'user','hostname':'E-DEV','ssid':'E-DEV'}
+    return defaults | (json.loads(p.read_text()) if p.exists() else {})
 def local_user(): return system_config()['user']
 def run(args, **kw): return sp.run(args, text=True, **kw)
 def out(args):
@@ -59,21 +61,13 @@ def welcome():
         print('\033[38;2;174;186;196m'+banner.read_text().rstrip()+'\033[0m')
     print('\nEgor Zvada  •  E-DEV  •  egor-zvada.ru')
     print('Wi-Fi: '+{'blocked':'выход закрыт','direct':'DIRECT · точка без VPN','vpn':'VPN','hybrid':'HYBRID · российские IP и исключения напрямую, остальные VPN'}.get(mode(),mode()))
-    print('Подсказки: e-dev help  |  Состояние: e-dev status  |  Ссылки: e-dev links\n')
+    print('Настройки: e-dev settings  |  Состояние: e-dev status  |  Инструкция: e-dev manuals\n')
     for n,a in management_ips():
         print(f'{n}: пароль https://{a}:9443/  |  сертификат https://{a}:8443/ui/')
     print()
-def help_(topic=None):
-    if topic=='wvpn': topic='wifi'
-    if not topic:
-        print((DOC/'wiki'/'index.txt').read_text()); return
-    if topic=='all': path=DOC/'E-DEV-guide.md'
-    else:
-        if not re.fullmatch('[a-z]+',topic): fail('e-dev help vpn|wifi|lan|panels|files|passwd|containers|troubleshoot|all')
-        path=DOC/'wiki'/(topic+'.txt')
-    if not path.exists(): fail('Нет такого раздела. e-dev help')
-    if sys.stdout.isatty(): run(['less','-R',str(path)])
-    else: print(path.read_text())
+def help_():
+    print((DOC/'wiki'/'index.txt').read_text())
+
 def root():
     if os.geteuid()!=0: os.execvp('sudo',['sudo','--','/usr/local/bin/e-dev']+sys.argv[1:])
 @contextlib.contextmanager
@@ -82,66 +76,43 @@ def policy_lock():
         fcntl.flock(lock,fcntl.LOCK_EX)
         yield
 
+def private_profile(path,data):
+    temporary=path.with_name(path.name+'.new')
+    fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    os.fchmod(fd,0o600)
+    with os.fdopen(fd,'w') as stream: stream.write(data)
+    temporary.replace(path)
+
 def wvpn(args):
-    sub=args[0] if args else 'status'
-    if sub=='status': return wifi_status()
-    if sub=='settings':
-        if args[1:] not in (['show'],['status']): root()
-        sys.exit(run(['/usr/local/sbin/e-dev-wifi']+args[1:]).returncode)
-    if sub=='vpn':
-        if len(args)!=2 or args[1] not in ('on','off'): fail('e-dev wifi vpn on|off')
-        sub=args[1];args=[sub]
-    if sub=='mode':
-        if len(args)==1:
-            if not sys.stdin.isatty(): fail('e-dev wifi mode vpn|direct|hybrid')
-            print('Маршрут Wi-Fi (сама точка остаётся включённой):\n  1. VPN\n  2. DIRECT — провайдер\n  3. HYBRID — российские сервисы напрямую')
-            choice=input('Выберите 1/2/3: ').strip()
-            value={'1':'vpn','2':'direct','3':'hybrid'}.get(choice)
-        else: value=args[1] if len(args)==2 else None
-        if value not in ('vpn','direct','hybrid'): fail('e-dev wifi mode vpn|direct|hybrid')
-        sub={'vpn':'on','direct':'off','hybrid':'hybrid'}[value];args=[sub]
-    if sub=='hybrid' and len(args)>1 and args[1] in ('settings','setting'):
-        root(); sys.exit(run(['/usr/local/sbin/e-dev-hybrid']+args[2:]).returncode)
-    root(); PROFILES.mkdir(mode=0o700,exist_ok=True)
-    if sub=='update':
-        sys.exit(run(['/usr/local/sbin/e-dev-geo-update']).returncode)
-    if sub=='check':
-        if len(args)!=2: fail('e-dev wifi check DOMAIN или IP')
-        return route_check(args[1])
-    if sub=='bypass':
-        sys.exit(run(['/usr/local/sbin/e-dev-hybrid','domains']+args[1:]).returncode)
-    if sub in ('off','on','hybrid'):
+    # Private operations used by Settings; old Wi-Fi mutation commands are gone.
+    root()
+    sub=args[0]
+    if sub in ('off','on','hybrid') and len(args)==1:
         sys.exit(run(['/usr/local/sbin/e-dev-vpn',sub]).returncode)
-    if sub=='profiles':
-        names=sorted(p.stem for p in PROFILES.glob('*.conf'))
-        config=json.loads((BASE/'vpn-policy.json').read_text()) if (BASE/'vpn-policy.json').exists() else {}
-        for n in names:
-            roles=[label for key,label in [('primary','основной'),('backup','резерв')] if config.get(key)==n]
-            print((' * ' if n==selected() else '   ')+n+(' ['+', '.join(roles)+']' if roles else ''))
-        if not names: print('Конфиги пока не импортированы.')
+    if sub=='import' and len(args)==3:
+        name,filename=args[1:];valid_name(name)
+        PROFILES.mkdir(mode=0o700,exist_ok=True)
+        with policy_lock():
+            source=P.Path(filename).expanduser().resolve()
+            if not source.is_file() or source.stat().st_size>65536: fail('Нужен обычный небольшой .conf файл.')
+            data=source.read_text()
+            if not all(x in data for x in ('[Interface]','[Peer]','PrivateKey','PublicKey','Endpoint')): fail('Это не полный клиентский конфиг AWG.')
+            if re.search(r'^\s*(PreUp|PostUp|PreDown|PostDown|SaveConfig)\s*=',data,re.M|re.I): fail('Конфиги с командами Pre/PostUp/Down или SaveConfig не импортируются.')
+            destination=PROFILES/(name+'.conf')
+            previous=destination.read_text() if destination.exists() else None
+            private_profile(destination,data);profile_names()
+            if name==selected() and (not (BASE/'vpn-enabled').exists() or (BASE/'vpn-enabled').read_text().strip()=='on'):
+                if run(['/usr/local/sbin/e-dev-vpn','use',name]).returncode:
+                    if previous is not None:
+                        private_profile(destination,previous)
+                        run(['/usr/local/sbin/e-dev-vpn','use',name])
+                    else: destination.unlink(missing_ok=True)
+                    profile_names()
+                    fail('Замена не запустилась. Предыдущий конфиг восстановлен; проверьте e-dev vpn status.')
+            print('Конфиг сохранён: '+name+' (ключи скрыты)')
         return
-    if sub in ('import','use'):
-        if len(args)<2 or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}',args[1]): fail('Имя: буквы, цифры, - или _, максимум 32 символа.')
-        name=args[1]
-        if sub=='import':
-            if len(args)!=3: fail('Использование: e-dev vpn add NAME FILE')
-            with policy_lock():
-                source=P.Path(args[2]).resolve()
-                if not source.is_file() or source.stat().st_size>65536: fail('Нужен обычный небольшой .conf файл.')
-                data=source.read_text()
-                if not all(x in data for x in ('[Interface]','[Peer]','PrivateKey','PublicKey','Endpoint')): fail('Это не полный клиентский конфиг AWG.')
-                if re.search(r'^\s*(PreUp|PostUp|PreDown|PostDown|SaveConfig)\s*=',data,re.M|re.I): fail('Конфиги с командами Pre/PostUp/Down или SaveConfig не импортируются.')
-                destination=PROFILES/(name+'.conf'); destination.write_text(data); destination.chmod(0o600)
-                (BASE/'profile-names').write_text('\n'.join(sorted(p.stem for p in PROFILES.glob('*.conf')))+'\n')
-                (BASE/'profile-names').chmod(0o644)
-                print('Конфиг сохранён:',name,'(ключи скрыты)')
-                if name==selected() and (not (BASE/'vpn-enabled').exists() or (BASE/'vpn-enabled').read_text().strip()=='on'):
-                    if run(['/usr/local/sbin/e-dev-vpn','use',name]).returncode: fail('Выбранный профиль не перезапущен. e-dev vpn status')
-        else:
-            if not (PROFILES/(name+'.conf')).is_file(): fail('Нет такого профиля. Сначала import.')
-            sys.exit(run(['/usr/local/sbin/e-dev-policy','manual',name]).returncode)
-        return
-    fail('Неизвестная команда. e-dev help')
+    fail('Настройки: e-dev settings')
+
 def profile_names():
     p=BASE/'profile-names';p.write_text('\n'.join(sorted(x.stem for x in PROFILES.glob('*.conf')))+'\n');p.chmod(0o644)
 def valid_name(name):
@@ -166,7 +137,7 @@ def vpn_status():
             if len(fields)==3: print('Через туннель: получено '+fields[1]+' байт; отправлено '+fields[2]+' байт')
     config=vpn_config();print('Выбор сервера: '+config['mode'].upper())
     print('Основной: '+str(config.get('primary') or 'не задан')+'; резерв: '+str(config.get('backup') or 'не задан'))
-    print('Режим AP: '+mode()+' (управление: e-dev wifi)')
+    print('Режим AP: '+mode()+' (настройки: e-dev settings → AP)')
     info=BASE/'geo-info.json'
     if info.exists():
         data=json.loads(info.read_text());print('IP-база RU: '+str(data['networks'])+' сетей; обновление UTC '+data['updated'])
@@ -177,19 +148,14 @@ def vpn(args):
     if sub in ('on','off') and len(args)==1:
         with policy_lock():
             sys.exit(run(['/usr/local/sbin/e-dev-vpn',{'on':'start','off':'stop'}[sub]]).returncode)
-    if sub in ('settings','default','manual','auto','speeds','selection','speedtest'):
+    if sub in ('default','manual','auto','speeds','speedtest'):
         sys.exit(run(['/usr/local/sbin/e-dev-policy',('status' if sub=='selection' else sub)]+args[1:]).returncode)
-    if sub in ('list','profiles'): return wvpn(['profiles'])
-    if sub=='use':
-        if len(args)!=2: fail('e-dev vpn use NAME')
-        sys.exit(run(['/usr/local/sbin/e-dev-policy','manual',args[1]]).returncode)
-    if sub in ('add','import'):
-        return wvpn([{'add':'import','import':'import','use':'use'}[sub]]+args[1:])
+    if sub=='add': return wvpn(['import']+args[1:])
     if sub=='remove' and len(args)==2:
         with policy_lock():
             name=args[1];valid_name(name)
-            if name in (vpn_config().get('primary'),vpn_config().get('backup')): fail('Профиль выбран основным или резервным. Сначала измените e-dev vpn default.')
-            if name==selected(): fail('Выбранный профиль удалить нельзя. Сначала e-dev vpn use ДРУГОЙ.')
+            if name in (vpn_config().get('primary'),vpn_config().get('backup')): fail('Профиль выбран основным или резервным. Измените роли в e-dev settings → VPN.')
+            if name==selected(): fail('Выбранный профиль удалить нельзя. Выберите другой профиль в e-dev settings → VPN.')
             path=PROFILES/(name+'.conf')
             if not path.exists(): fail('Нет такого профиля.')
             path.unlink();profile_names();print('Профиль удалён: '+name);return
@@ -211,7 +177,7 @@ def vpn(args):
                     if row.get('name')==old: row['name']=new
                 speeds.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
             profile_names();print('Профиль переименован: '+old+' → '+new);return
-    fail('e-dev help vpn')
+    fail('Настройки: e-dev settings → VPN')
 def set_contains(name,addr):
     return run(['nft','get','element','inet','e_dev_split',name,'{ '+str(addr)+' }'],stdout=sp.DEVNULL,stderr=sp.DEVNULL).returncode==0
 
@@ -242,15 +208,30 @@ def password(service):
     print('Incus UI входит по сертификату. all меняет SSH, SMB, Wi-Fi AP и LXConsole.')
     p=getpass.getpass('Новый пароль: '); confirm=getpass.getpass('Повторите: ')
     if p!=confirm or not 8<=len(p)<=63 or any(ord(c)<32 or ord(c)>126 for c in p): fail('Пароли должны совпадать: 8–63 печатных ASCII-символа.')
+    apply_password(service,p)
+
+def apply_password(service,p):
+    if service not in ('all','ssh','files','wifi','ui') or not 8<=len(p)<=63 or any(ord(c)<32 or ord(c)>126 for c in p):
+        raise ValueError('Пароль: 8–63 печатных ASCII-символа.')
     tasks=('ssh','files','ui','wifi') if service=='all' else (service,)
     for t in tasks:
         if t=='ssh': r=run(['chpasswd'],input=local_user()+':'+p+'\n')
         elif t=='files': r=run(['smbpasswd','-s',local_user()],input=p+'\n'+p+'\n',stdout=sp.DEVNULL)
         elif t=='wifi':
-            r=run(['nmcli','con','modify','E-DEV-AP','wifi-sec.psk',p],stdout=sp.DEVNULL)
-            if r.returncode==0:
-                print('Пароль AP сохранён. При следующем переподключении понадобится новый пароль.')
-                r=run(['nmcli','con','up','E-DEV-AP'],stdout=sp.DEVNULL)
+            import runpy
+            backend=runpy.run_path('/usr/local/sbin/e-dev-wifi')
+            data=backend['current']();data['radio']=dict(backend['radio_current'](),psk=p)
+            backend['queue'](data)
+            print('Пароль AP передан службе; клиенты переподключатся.',flush=True)
+            for _ in range(180):
+                if not backend['REQUEST'].exists():
+                    if out(['systemctl','show','-p','Result','--value','e-dev-wifi-apply.service'])!='success':
+                        fail('Пароль AP не применён. Остальные выполненные изменения сохраняются; журнал e-dev-wifi-apply.')
+                    print('Пароль обновлён: wifi')
+                    break
+                time.sleep(1)
+            else: fail('Применение AP ещё выполняется. Проверьте journalctl -u e-dev-wifi-apply.')
+            continue
         else:
             code="from lxconsole import app,db,bcrypt; from lxconsole.models import User; import sys\nwith app.app_context():\n u=User.query.filter_by(username=sys.argv[1]).one(); u.password=bcrypt.generate_password_hash(sys.stdin.read()).decode(); db.session.commit()\n"
             r=run(['runuser','-u','lxconsole','--','/opt/lxconsole/.venv/bin/python','-c',code,local_user()],cwd='/opt/lxconsole',input=p,stdout=sp.DEVNULL)
@@ -262,14 +243,14 @@ def wifi_status():
     connection=out(['nmcli','-g','GENERAL.CONNECTION','device','show','wlan0'])
     active=state.startswith('100') and connection=='E-DEV-AP'
     print('Wi-Fi AP: '+('ВКЛЮЧЕНА' if active else 'НЕ АКТИВНА')+' · '+cfg.get('ssid','E-DEV'))
-    print('Режим трафика: '+{'vpn':'VPN — весь интернет через VPN','direct':'DIRECT — через провайдера','hybrid':'HYBRID — российские IP/исключения напрямую, остальное VPN'}.get(mode(),mode()))
+    print('Режим трафика: '+{'vpn':'VPN ON','direct':'VPN OFF','hybrid':'HYBRID'}.get(mode(),mode()))
     on=(BASE/'vpn-enabled').read_text().strip()=='on' if (BASE/'vpn-enabled').exists() else True
     iface=P.Path('/sys/class/net/awg0').exists()
     print('VPN-туннель: '+('ВКЛЮЧЁН' if on else 'ВЫКЛЮЧЕН')+'; интерфейс '+('поднят' if iface else 'отсутствует'))
     print('VPN-сервер: '+selected()+'; выбор: '+policy['mode'].upper())
     if policy['mode']=='default': print('Основной: '+str(policy.get('primary') or '—')+'; резерв: '+str(policy.get('backup') or '—'))
-    print('Адрес OUT: '+next((a for n,a in ips() if n==out_device()),'нет IPv4')+' · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
-    if mode()!='direct' and not (on and iface): print('VPN-выход закрыт. Для прямого выхода AP: e-dev wifi vpn off')
+    print('Адрес OUT: '+next((a for n,a in ips() if n==out_device()),'нет IPv4')+' · режим трафика настраивается в e-dev settings → AP.')
+    if mode()!='direct' and not (on and iface): print('VPN-выход закрыт. Прямой выход: e-dev settings → AP → режим трафика → VPN OFF')
 
 def wifi_clients():
     root()
@@ -304,29 +285,27 @@ def wifi_clients():
         for mac,addr,name in old: print(f'  {addr:16} {mac}  '+('—' if name=='*' else name))
 
 def main():
-    args=sys.argv[1:]; cmd=args[0].lower() if args else 'help'
-    if cmd=='status' and args[1:]==['--once']: status_text()
-    elif cmd in ('help','man'): help_(args[1].lower() if len(args)>1 else None)
-    elif cmd=='wifi':
-        if args[1:]==['clients']: wifi_clients()
-        else: wvpn(args[1:])
-    elif cmd=='links': links()
-    elif cmd=='status': status()
-    elif cmd=='welcome': welcome()
-    elif cmd=='wvpn': wvpn(args[1:])
-    elif cmd=='vpn': vpn(args[1:])
-    elif cmd=='lan':
-        sub=args[1].lower() if len(args)>1 else 'status'
-        if sub!='status': root()
-        sys.exit(run(['/usr/local/sbin/e-dev-lan-ui'] if sub=='setup' else ['/usr/local/sbin/e-dev-lan']+[sub]).returncode)
-    elif cmd=='speedtest': vpn(['speedtest'])
-    elif cmd=='passwd': password(args[1].lower() if len(args)>1 else 'all')
-    elif cmd=='containers': run(['incus','list'])
-    elif cmd=='container' and len(args)==3 and args[1] in ('start','stop'):
-        if not re.fullmatch('[a-zA-Z0-9_-]+',args[2]): fail('Некорректное имя.')
-        sys.exit(run(['incus',args[1],args[2]]).returncode)
-    elif cmd=='docs': run(['less',str(DOC/'E-DEV-guide.md')])
-    else: fail('Неизвестная команда. e-dev help')
+    args=sys.argv[1:]
+    cmd=args[0].lower() if args else 'help'
+    tail=args[1:]
+    if cmd=='help' and not tail: help_()
+    elif cmd=='settings' and not tail:
+        root();sys.exit(run(['/usr/local/sbin/e-dev-settings']).returncode)
+    elif cmd=='manuals' and not tail:
+        sys.exit(run(['/usr/local/sbin/e-dev-settings','manuals']).returncode)
+    elif cmd=='status' and not tail: status()
+    elif cmd=='status' and tail==['--once']: status_text()
+    elif cmd=='links' and not tail: links()
+    elif cmd=='welcome' and not tail: welcome()
+    elif cmd=='wifi' and tail==['clients']: wifi_clients()
+    elif cmd=='wifi' and tail==['status']: wifi_status()
+    elif cmd=='vpn' and tail==['status']: vpn_status()
+    elif cmd=='vpn' and len(tail)==3 and tail[0]=='add': vpn(tail)
+    elif cmd=='lan' and tail==['status']:
+        sys.exit(run(['/usr/local/sbin/e-dev-lan','status']).returncode)
+    elif cmd=='speedtest' and not tail: vpn(['speedtest'])
+    elif cmd=='passwd' and tail==['all']: password('all')
+    else: fail('Настройки: e-dev settings. Инструкция: e-dev manuals. Команды: e-dev help')
 if __name__=='__main__':
     try: main()
     except (OSError,ValueError,sp.CalledProcessError) as e: fail(str(e))

@@ -36,7 +36,10 @@ def call(*args, input=None):
 
 def save(path, data, mode=0o644):
     new = path.with_name(path.name+'.new')
-    new.write_text(json.dumps(data, ensure_ascii=False, indent=2)+'\n')
+    fd = os.open(new, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, indent=2)+'\n')
     new.chmod(mode)
     new.replace(path)
 
@@ -83,7 +86,77 @@ def validate(data, routes):
     lease = int(data.get('lease', 0))
     if lease != 0 and not 120 <= lease <= 31536000:
         raise ValueError('DHCP lease: 0 (час по умолчанию) или 120–31536000 секунд.')
-    return dict(address=str(ap), dhcp_range=pool, lease=lease)
+    result = dict(address=str(ap), dhcp_range=pool, lease=lease)
+    if 'radio' in data:
+        result['radio'] = validate_radio(data['radio'])
+    return result
+
+
+def validate_radio(data):
+    ssid = data['ssid']
+    if not 1 <= len(ssid.encode()) <= 32 or any(ord(c)<32 for c in ssid):
+        raise ValueError('SSID: 1–32 байта без управляющих символов.')
+    band, channel = data['band'], int(data['channel'])
+    if band not in ('bg', 'a') or not 0 <= channel <= 196 or band=='bg' and channel>14:
+        raise ValueError('Нужен диапазон 2.4/5 GHz и допустимый канал; 0 — автоматически.')
+    result = dict(ssid=ssid, band=band, channel=channel)
+    if 'psk' in data:
+        p = data['psk']
+        if not 8<=len(p)<=63 or any(ord(c)<32 or ord(c)>126 for c in p):
+            raise ValueError('Пароль AP: 8–63 печатных ASCII-символа.')
+        result['psk'] = p
+    return result
+
+
+RADIO_FIELDS = ['802-11-wireless.ssid', '802-11-wireless.band', '802-11-wireless.channel',
+                '802-11-wireless-security.key-mgmt', '802-11-wireless-security.proto',
+                '802-11-wireless-security.pairwise', '802-11-wireless-security.group']
+
+
+def radio_current():
+    values = call('nmcli', '--escape', 'no', '-g', ','.join(RADIO_FIELDS[:3]),
+                  'connection', 'show', CONNECTION).split('\n')
+    return dict(ssid=values[0], band=values[1] or 'bg', channel=int(values[2] or 0))
+
+
+def radio_profiles():
+    plan = json.loads((B/'lan.json').read_text()) if (B/'lan.json').exists() else {}
+    return list(dict.fromkeys([CONNECTION]+[e['profile'] for e in plan.get('outputs', {}).values() if e['type']=='wifi']))
+
+
+def radio_snapshot():
+    return {profile:dict(properties=dict(zip(RADIO_FIELDS,
+                call('nmcli', '--escape', 'no', '-g', ','.join(RADIO_FIELDS), 'connection', 'show', profile).split('\n'))),
+                psk=call('nmcli', '--show-secrets', '-g', '802-11-wireless-security.psk', 'connection', 'show', profile))
+            for profile in radio_profiles()}
+
+
+def radio_modify(data):
+    lan = runpy.run_path('/usr/local/sbin/e-dev-lan')
+    for profile in radio_profiles():
+        password = data.get('psk') or call('nmcli','--show-secrets','-g','802-11-wireless-security.psk','connection','show',profile)
+        call('nmcli', 'connection', 'modify', profile, 'wifi.ssid', data['ssid'], 'wifi.band', data['band'],
+             'wifi.channel', str(data['channel']) if data['channel'] else '', 'wifi-sec.key-mgmt', 'wpa-psk',
+             'wifi-sec.proto', 'rsn', 'wifi-sec.pairwise', 'ccmp', 'wifi-sec.group', 'ccmp')
+        lan['set_password'](profile, password)
+
+
+def radio_restore(snapshot):
+    lan = runpy.run_path('/usr/local/sbin/e-dev-lan')
+    for profile, data in snapshot.items():
+        call('nmcli', 'connection', 'modify', profile,
+             *[value for key,value in data['properties'].items() for value in (key,'' if key.endswith('.channel') and str(value)=='0' else str(value))])
+        lan['set_password'](profile, data['psk'])
+
+
+def radio_activate():
+    lan = runpy.run_path('/usr/local/sbin/e-dev-lan')
+    devices = lan['inventory']()
+    plan = json.loads((B/'lan.json').read_text()) if (B/'lan.json').exists() else {}
+    attached = {entry['profile'] for entry in plan.get('outputs', {}).values() if lan['resolve'](entry, devices)}
+    for profile in radio_profiles():
+        if profile==CONNECTION or profile in attached:
+            call('nmcli', '--wait', '20', 'connection', 'up', profile)
 
 
 def kernel_routes():
@@ -146,17 +219,27 @@ def apply():
         settings = B/'wifi.json'
         old_settings = settings.read_text() if settings.exists() else None
         old_dns = (B/'dns.conf').read_text()
+        old_radio = radio_snapshot() if 'radio' in data else None
+        system = B/'system.json'
+        old_system = system.read_text() if system.exists() else None
         backup = BACKUPS/('wifi-'+str(time.time_ns()))
         backup.mkdir(parents=True, mode=0o700)
-        save(backup/'settings.json', dict(nm=old, wifi=old_settings, dns=old_dns), 0o600)
+        save(backup/'settings.json', dict(nm=old, wifi=old_settings, dns=old_dns, radio=old_radio, system=old_system), 0o600)
         runtime = runpy.run_path('/usr/local/sbin/e-dev-vpn')
         mode = runtime['readmode']()
         block_ap()
         try:
             modify(data)
-            save(settings, data)
+            if old_radio is not None:
+                radio_modify(data['radio'])
+            save(settings, {k:v for k,v in data.items() if k!='radio'})
             dns_address(data['address'])
             call('nmcli', '--wait', '30', 'connection', 'up', connection())
+            if old_radio is not None:
+                radio_activate()
+                info = json.loads(old_system) if old_system else {}
+                info['ssid'] = data['radio']['ssid']
+                save(system, info)
             runtime['routes'](mode)
             runtime['guard'](mode)
             call('systemctl', 'restart', 'e-dev-dns')
@@ -165,12 +248,20 @@ def apply():
             # A failed rollback keeps the temporary drop rule; it never opens a direct path.
             try:
                 modify(old)
+                if old_radio is not None:
+                    radio_restore(old_radio)
+                    if old_system is None:
+                        system.unlink(missing_ok=True)
+                    else:
+                        system.write_text(old_system)
                 if old_settings is None:
                     settings.unlink(missing_ok=True)
                 else:
                     settings.write_text(old_settings)
                 (B/'dns.conf').write_text(old_dns)
                 call('nmcli', '--wait', '30', 'connection', 'up', connection())
+                if old_radio is not None:
+                    radio_activate()
                 runtime['routes'](mode)
                 runtime['guard'](mode)
                 call('systemctl', 'restart', 'e-dev-dns')
@@ -199,7 +290,7 @@ def queue(data):
             raise
     print('Настройки переданы службе. Wi-Fi-клиенты переподключатся и получат новые адреса.')
     print('Адрес Pi после применения: '+str(I.IPv4Interface(data['address']).ip))
-    print('Результат: e-dev wifi settings show · journalctl -u e-dev-wifi-apply')
+    print('Результат: e-dev wifi status · journalctl -u e-dev-wifi-apply')
 
 
 def execute(args):
@@ -207,7 +298,7 @@ def execute(args):
     if sub in ('show', 'status') and len(args) == 1:
         return show()
     if os.geteuid() != 0:
-        raise ValueError('Настройки меняются через e-dev wifi settings (sudo).')
+        raise ValueError('Настройки: e-dev settings → AP (sudo).')
     if args == ['apply']:
         return apply()
     data = current()
@@ -218,44 +309,12 @@ def execute(args):
     elif sub == 'lease' and len(args) == 2:
         data['lease'] = int(args[1])
     else:
-        raise ValueError('e-dev wifi settings show | network IP/MASK [START END] | dhcp auto/START END | lease SECONDS')
+        raise ValueError('Настройки: e-dev settings → AP → Подсеть и DHCP')
     queue(data)
 
 
-def menu():
-    if not sys.stdin.isatty():
-        raise ValueError('Меню требует терминал. e-dev wifi settings show')
-    while True:
-        print('\nWi-Fi AP · сеть и DHCP\n  1. Текущие настройки\n  2. Сменить подсеть/адрес Pi\n'
-              '  3. Диапазон DHCP\n  4. Срок аренды DHCP\n  0. Выход')
-        choice = input('Выберите пункт: ').strip()
-        if choice in ('', '0', 'q'):
-            return
-        try:
-            if choice == '1':
-                show()
-                continue
-            if choice == '2':
-                args = ['network', input('Новый адрес Pi с маской, например 192.168.50.1/24: ').strip()]
-            elif choice == '3':
-                args = ['dhcp']+input('auto или начало и конец диапазона через пробел: ').split()
-            elif choice == '4':
-                args = ['lease', input('Аренда в секундах (0 = 1 час): ').strip()]
-            else:
-                print('Нет такого пункта.')
-                continue
-            print('Изменение: '+' '.join(args)+'. Точка переподключится; SSH через Wi-Fi может оборваться.')
-            if input('Применить? [y/N]: ').strip().lower() in ('y', 'yes', 'д', 'да'):
-                execute(args)
-        except (ValueError, OSError, S.SubprocessError) as error:
-            print(str(error))
-
-
-if __name__ == '__main__':
-    try:
-        execute(sys.argv[1:]) if len(sys.argv) > 1 else menu()
-    except (ValueError, OSError, S.SubprocessError) as error:
-        print(str(error), file=sys.stderr)
-        sys.exit(1)
-    except (KeyboardInterrupt, EOFError):
-        print('\nМеню закрыто.')
+if __name__=='__main__':
+    try: execute(sys.argv[1:] or ['show'])
+    except (ValueError,OSError,S.SubprocessError) as error:
+        print(str(error),file=sys.stderr);sys.exit(1)
+    except KeyboardInterrupt: pass

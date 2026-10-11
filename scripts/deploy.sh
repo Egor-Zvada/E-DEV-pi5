@@ -5,13 +5,14 @@ REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID == 0 ]] || { echo 'Требуется root' >&2; exit 1; }
 python3 "$REPO_DIR/scripts/build_wiki.py"
 install -m 755 "$REPO_DIR/src/e-dev" /usr/local/bin/e-dev
-for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui; do
+for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui e-dev-tui e-dev-actions e-dev-settings; do
     install -m 755 "$REPO_DIR/src/$component" "/usr/local/sbin/$component"
 done
 for alias_name in E-DEV E-dev edev; do ln -sfn /usr/local/bin/e-dev "/usr/local/bin/$alias_name"; done
 install -d -m 755 /opt/e-dev/docs/wiki /usr/local/share/man/man1 /etc/bash_completion.d
 install -m 644 "$REPO_DIR/assets/completion" /etc/bash_completion.d/e-dev
 install -m 644 "$REPO_DIR/assets/"logo*.txt /opt/e-dev/docs/
+rm -f /opt/e-dev/docs/wiki/wifi.txt /opt/e-dev/docs/wiki/passwd.txt
 install -m 644 "$REPO_DIR/docs/wiki/"*.txt /opt/e-dev/docs/wiki/
 install -m 644 "$REPO_DIR/docs/COMMANDS.md" /opt/e-dev/docs/E-DEV-guide.md
 install -m 644 "$REPO_DIR/docs/e-dev.1" /usr/local/share/man/man1/e-dev.1

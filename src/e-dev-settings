@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""E-DEV 1.0: one terminal settings UI; existing controllers own changes."""
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib as P
+import shutil
+import subprocess as S
+import sys
+import tempfile
+import time
+
+B=P.Path('/etc/e-dev')
+DOC=P.Path('/opt/e-dev/docs/wiki')
+ACTIONS='/usr/local/sbin/e-dev-actions'
+CHAPTERS=[('overview','Начало и управление'),('lan','LAN · входы и резервирование'),
+          ('out','OUT · дополнительные порты'),('ap','AP · Wi-Fi, DHCP и DNS'),
+          ('hybrid','Hybrid · прямые исключения'),('vpn','VPN · профили и режимы'),
+          ('access','Доступ, пароли и сертификаты'),('panels','Вход в панели'),
+          ('containers','Контейнеры и ARM/x86'),('files','Файлы с Mac/iPhone'),
+          ('troubleshoot','Диагностика')]
+
+
+def load(name):
+    path=P.Path('/usr/local/sbin')/name
+    if not path.exists(): path=P.Path(__file__).with_name(name)
+    loader=importlib.machinery.SourceFileLoader(name.replace('-','_')+'_settings',str(path))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader))
+    loader.exec_module(module)
+    return module
+
+
+lanui=load('e-dev-lan-ui')
+lan=lanui.lan
+tui=load('e-dev-tui')
+
+
+def cfg(name, default=None):
+    path=B/name
+    return json.loads(path.read_text()) if path.exists() else default or {}
+
+
+def text(name, default='—'):
+    path=B/name
+    return path.read_text().strip() if path.exists() else default
+
+
+def output(*args):
+    r=S.run(args,text=True,capture_output=True,stdin=S.DEVNULL,timeout=30)
+    if r.returncode: raise ValueError('Не удалось выполнить '+args[0])
+    return r.stdout.strip()
+
+
+def operation(ui,title,args,payload=None):
+    hint='\nИзмерения скорости могут занять несколько минут.' if 'speedtest' in args or 'auto' in args else ''
+    ui.run(title,'--infobox','Выполняю…'+hint)
+    with tempfile.TemporaryFile(mode='w+t') as log:
+        process=S.Popen(args,text=True,stdin=S.PIPE if payload is not None else S.DEVNULL,stdout=log,stderr=S.STDOUT)
+        try:
+            if payload is not None:
+                process.stdin.write(json.dumps(payload));process.stdin.close()
+            started=time.monotonic()
+            while process.poll() is None:
+                if time.monotonic()-started>1200: raise ValueError('Операция превысила время ожидания.')
+                log.seek(0);progress=log.read()[-1200:]
+                ui.run(title,'--infobox','Выполняю…\n'+progress)
+                time.sleep(1)
+            log.seek(0);result=log.read()[-3500:]
+            if process.returncode: raise ValueError(result or 'Операция не завершилась.')
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=30)
+                except S.TimeoutExpired: process.kill();process.wait()
+    ui.message(title,result or 'Готово.')
+    return result
+
+
+def action(ui,title,*args,payload=None):
+    return operation(ui,title,[ACTIONS,*args],payload)
+
+
+def wait_ap(ui):
+    ui.run('Применение AP','--infobox','Служба применяет настройки точки…')
+    for _ in range(180):
+        if not P.Path('/run/e-dev-wifi-request.json').exists():
+            result=output('systemctl','show','-p','Result','--value','e-dev-wifi-apply.service')
+            if result!='success': raise ValueError('Настройки AP не применены. Служба выполнила откат либо закрыла OUT.\nЖурнал: journalctl -u e-dev-wifi-apply')
+            ui.message('AP','Настройки применены.\nТекущие адреса: e-dev links')
+            return
+        time.sleep(1)
+    ui.message('AP','Применение продолжается.\nЖурнал: journalctl -u e-dev-wifi-apply')
+
+
+def password(ui,service):
+    labels={'all':'Общий пароль SSH / LXConsole / файлов / AP','wifi':'Пароль точки доступа',
+            'ssh':'Пароль SSH','ui':'Пароль LXConsole','files':'Пароль файлов SMB'}
+    prompt='8–63 печатных ASCII-символа. Ввод скрыт.'
+    first=ui.password(labels[service],prompt)
+    if first is None: return
+    second=ui.password(labels[service],'Повторите новый пароль:')
+    if second is None: return
+    if first!=second: raise ValueError('Пароли не совпадают.')
+    if not 8<=len(first)<=63 or any(ord(c)<32 or ord(c)>126 for c in first):
+        raise ValueError('Нужно 8–63 печатных ASCII-символа.')
+    if service in ('wifi','all') and not ui.yes('Сменить пароль?',
+        'Wi-Fi-клиенты потребуется подключить с новым паролем.\nSSH через AP может оборваться.\n'+('Все четыре пароля будут изменены последовательно.' if service=='all' else 'Изменится пароль всех Wi-Fi AP в OUT.')):
+        return
+    action(ui,'Смена пароля','password',service,payload={'password':first})
+    if service in ('wifi','all'): wait_ap(ui)
+
+
+def radio_menu(ui):
+    wifi=load('e-dev-wifi')
+    while True:
+        data=wifi.radio_current()
+        choice=ui.menu('AP · Wi-Fi',data['ssid']+' · '+('2.4 GHz' if data['band']=='bg' else '5 GHz')+' · канал '+(str(data['channel']) if data['channel'] else 'AUTO')+'\nЗащита WPA2 / AES-CCMP',
+                       [('ssid','Название сети'),('radio','Диапазон и канал'),('password','Пароль Wi-Fi')])
+        if choice is None: return
+        if choice=='password': password(ui,'wifi');continue
+        if choice=='ssid':
+            value=ui.input('Название AP','SSID: 1–32 байта.',data['ssid'])
+            if value is None: continue
+            data['ssid']=value
+        elif choice=='radio':
+            band=ui.menu('Диапазон AP','Выберите диапазон.',[('bg','2.4 GHz'),('a','5 GHz')])
+            if band is None: continue
+            channels=[0,1,6,11] if band=='bg' else [0,36,40,44,48,149,153,157,161]
+            channel=ui.menu('Канал AP','Доступность зависит от адаптера и страны Wi-Fi.',
+                            [(str(c),'AUTO' if c==0 else str(c)) for c in channels]+[('custom','Ввести другой канал')])
+            if channel is None: continue
+            if channel=='custom': channel=ui.input('Канал AP','Номер канала; 0 — автоматически.',str(data['channel']))
+            if channel is None: continue
+            data.update(band=band,channel=int(channel))
+        data=wifi.validate_radio(data)
+        if not ui.yes('Применить AP?',data['ssid']+' · '+data['band']+' · канал '+str(data['channel'])+'\nWi-Fi переподключится. При ошибке служба выполнит откат.'):
+            continue
+        action(ui,'Настройки AP','radio',payload=data)
+        wait_ap(ui)
+
+
+def direct_rules(ui,kind):
+    hybrid=load('e-dev-hybrid')
+    title='Прямые домены' if kind=='domains' else 'Прямые IP / сети'
+    filename='direct-domains' if kind=='domains' else 'direct-ips'
+    while True:
+        values=hybrid.words(filename)
+        choice=ui.menu(title,'Эти назначения идут напрямую в режиме HYBRID.',
+                       [('add','Добавить правило')]+[('rule:'+value,value) for value in values])
+        if choice is None: return
+        if choice=='add':
+            value=ui.input(title,'Домен без https:// и пути:' if kind=='domains' else 'Публичный IPv4 или сеть CIDR:')
+            if value: action(ui,title,'hybrid',kind,'add',value)
+        else:
+            value=choice.removeprefix('rule:')
+            if ui.yes('Удалить правило?',value): action(ui,title,'hybrid',kind,'del',value)
+
+
+def hybrid_menu(ui):
+    while True:
+        data=cfg('hybrid.json',dict(geo=True,autoupdate=True,dns=['1.1.1.1','8.8.8.8']))
+        geo=cfg('geo-info.json')
+        updated=geo.get('updated','нет')
+        if updated!='нет':
+            try: updated=datetime.datetime.fromisoformat(updated).astimezone().strftime('%d.%m.%Y %H:%M')
+            except ValueError: pass
+        choice=ui.menu('AP · Hybrid Settings','RU-база: '+str(geo.get('networks',0))+' сетей\nОбновление: '+str(updated),
+                       [('geo','Учёт RU IP-базы · '+('ВКЛ' if data['geo'] else 'ВЫКЛ')),
+                        ('autoupdate','Ежедневное обновление · '+('ВКЛ' if data['autoupdate'] else 'ВЫКЛ')),
+                        ('update','Обновить IP-базу сейчас'),('domains','Прямые домены'),
+                        ('ips','Прямые IP / сети'),('check','Проверить маршрут домена / IP')])
+        if choice is None: return
+        if choice in ('geo','autoupdate'):
+            action(ui,'Hybrid Settings','hybrid',choice,'off' if data[choice] else 'on')
+        elif choice=='update': action(ui,'RU IP-база','hybrid','geo','update')
+        elif choice in ('domains','ips'): direct_rules(ui,choice)
+        elif choice=='check':
+            value=ui.input('Проверка маршрута','Домен или IPv4:')
+            if value: action(ui,'Маршрут','check',value)
+
+
+def ap_menu(ui):
+    while True:
+        wifi=load('e-dev-wifi');network=wifi.current()
+        mode={'vpn':'VPN ON','direct':'VPN OFF','hybrid':'HYBRID'}.get(text('mode'),'ЗАКРЫТ')
+        choice=ui.menu('AP · сеть клиентов',network['address']+' · '+mode+'\nПодсеть, DHCP, DNS и режим трафика общие для всех OUT-портов.',
+                       [('wifi','Wi-Fi · название, пароль, канал'),('dhcp','Подсеть и DHCP'),
+                        ('dns','DNS · '+', '.join(cfg('hybrid.json',{'dns':['1.1.1.1','8.8.8.8']})['dns'])),
+                        ('mode','Режим трафика · '+mode),('hybrid','Hybrid Settings')])
+        if choice is None: return
+        if choice=='wifi': radio_menu(ui)
+        elif choice=='dhcp': lanui.dhcp_menu(ui)
+        elif choice=='dns':
+            value=ui.input('DNS AP','От одного до трёх публичных DNS IPv4 через пробел:',
+                           ' '.join(cfg('hybrid.json',{'dns':['1.1.1.1','8.8.8.8']})['dns']))
+            if value: action(ui,'DNS AP','hybrid','dns',*value.split())
+        elif choice=='mode':
+            selected=ui.menu('Режим трафика AP','Точка продолжает раздавать Wi-Fi во всех трёх режимах.\nСам туннель включается отдельно в разделе VPN.',
+                             [('on','VPN ON · весь интернет через VPN'),('off','VPN OFF · весь интернет через провайдера'),
+                              ('hybrid','HYBRID · российские сети напрямую, остальное VPN')])
+            if selected: action(ui,'Маршрут AP','traffic',selected)
+        elif choice=='hybrid': hybrid_menu(ui)
+
+
+def lan_menu(ui):
+    while True:
+        plan=lan.config();state=lan.read(lan.STATE,{})
+        choice=ui.menu('LAN · IN','Активный вход: '+lanui.name(plan,state.get('active'),lan.inventory()),
+                       [('ports','Входы интернета'),('roles','Основной / резервы / автопереход'),
+                        ('check','Проверить входы сейчас'),('status','Состояние LAN')])
+        if choice is None: return
+        if choice=='ports': lanui.zone_menu(ui,'inputs')
+        elif choice=='roles': lanui.roles(ui)
+        elif choice=='status': ui.message('LAN',lanui.review(plan))
+        elif choice=='check':
+            operation(ui,'Проверка входов',['systemctl','start','e-dev-uplink.service'])
+            ui.message('LAN',output('/usr/local/sbin/e-dev-lan','status'))
+
+
+def choose_profile(ui,title,exclude=None,allow_none=False):
+    names=sorted(p.stem for p in (B/'profiles').glob('*.conf') if p.stem!=exclude)
+    if not names and not allow_none: raise ValueError('Сначала импортируйте VPN-конфигурацию.')
+    return ui.menu(title,'Выберите профиль.',[(n,n+(' · активный' if n==text('selected-profile') else '')) for n in names]+([('-','Без резерва')] if allow_none else []))
+
+
+def vpn_selection(ui):
+    mode=ui.menu('Выбор VPN','Общий VPN для AP и контейнеров профиля vpn.',
+                 [('default','DEFAULT · основной и резерв'),('manual','MANUAL · только один профиль'),
+                  ('auto','AUTO · ежедневный выбор по скорости')])
+    if mode is None: return
+    if mode=='default':
+        primary=choose_profile(ui,'Основной VPN')
+        if primary is None: return
+        backup=choose_profile(ui,'Резервный VPN',exclude=primary,allow_none=True)
+        if backup is None: return
+        action(ui,'DEFAULT','vpn','default',primary,backup)
+    elif mode=='manual':
+        selected=choose_profile(ui,'Единственный VPN')
+        if selected is not None: action(ui,'MANUAL','vpn','manual',selected)
+    else:
+        if not list((B/'profiles').glob('*.conf')): raise ValueError('Сначала импортируйте VPN-конфигурацию.')
+        if ui.yes('Включить AUTO?','Каждый профиль измеряется Ookla Speedtest.\nПолный тест расходует сотни MB на профиль.\nДалее ежедневные проверки выполняет сама Pi.'):
+            action(ui,'AUTO','vpn','auto')
+
+
+def vpn_profiles(ui):
+    while True:
+        policy=cfg('vpn-policy.json');active=text('selected-profile')
+        names=sorted(p.stem for p in (B/'profiles').glob('*.conf'))
+        choice=ui.menu('VPN · конфигурации','Ключи скрыты. Имена и роли читаются из текущих настроек.',
+                       [('add','Импортировать .conf')]+[('profile:'+n,n+(' · активный' if n==active else '')+
+                       (' · основной' if n==policy.get('primary') else '')+(' · резерв' if n==policy.get('backup') else '')) for n in names])
+        if choice is None: return
+        if choice=='add':
+            path=ui.file('Импорт AmneziaWG .conf')
+            if path is None: continue
+            name=ui.input('Имя VPN','Буквы, цифры, дефис, подчёркивание; до 32 символов.',P.Path(path).stem.replace(' ','-')[:32])
+            if not name: continue
+            if name in names and not ui.yes('Заменить VPN?',name+' уже существует. Активный профиль будет переподключён.'): continue
+            action(ui,'Импорт VPN','vpn','add',name,path)
+        else:
+            choice=choice.removeprefix('profile:')
+            selected=ui.menu('VPN · '+choice,'Профиль '+choice,[('replace','Заменить конфигурацию'),('rename','Переименовать'),('remove','Удалить')])
+            if selected=='replace':
+                path=ui.file('Новый .conf для '+choice)
+                if path and ui.yes('Заменить конфигурацию?',choice+'\nАктивный профиль будет переподключён.'):
+                    action(ui,'Замена VPN','vpn','add',choice,path)
+            elif selected=='rename':
+                name=ui.input('Новое имя VPN','Роли основного и резервного сохранятся.',choice)
+                if name and name!=choice: action(ui,'Переименование VPN','vpn','rename',choice,name)
+            elif selected=='remove' and ui.yes('Удалить VPN?',choice+'\nАктивный, основной и резервный профили сначала нужно освободить.'):
+                action(ui,'Удаление VPN','vpn','remove',choice)
+
+
+def vpn_measurements(ui):
+    while True:
+        choice=ui.menu('VPN · измерения','Speedtest активного VPN не меняет выбор сервера.',
+                       [('active','Измерить активный VPN'),('results','Последние результаты AUTO'),
+                        ('repeat','Повторить сравнение AUTO сейчас')])
+        if choice is None: return
+        if choice=='results': action(ui,'Результаты AUTO','vpn','speeds')
+        elif choice=='active': action(ui,'Speedtest','vpn','speedtest')
+        elif choice=='repeat':
+            if cfg('vpn-policy.json').get('mode')!='auto': raise ValueError('Повторное сравнение доступно в режиме AUTO.')
+            if ui.yes('Повторить AUTO?', 'Все профили будут измерены заново. Тест расходует трафик.'):
+                action(ui,'Сравнение AUTO','vpn','auto','run')
+
+
+def vpn_menu(ui):
+    while True:
+        enabled=text('vpn-enabled','on')=='on'
+        choice=ui.menu('VPN',text('selected-profile')+' · '+cfg('vpn-policy.json',{'mode':'manual'})['mode'].upper()+'\nОбщий туннель для AP и VPN-контейнеров.',
+                       [('tunnel','Туннель · '+('ВКЛ · awg0' if enabled and P.Path('/sys/class/net/awg0').exists() else 'ВКЛ · нет awg0' if enabled else 'ВЫКЛ')),
+                        ('selection','Выбор сервера · DEFAULT / MANUAL / AUTO'),
+                        ('profiles','Конфигурации'),('measure','Измерения скорости'),('status','Состояние туннеля')])
+        if choice is None: return
+        if choice=='tunnel':
+            selected=ui.menu('Туннель VPN','VPN OFF в AP меняет маршрут; здесь включается/выключается сам туннель.',
+                             [('on','Включить туннель'),('off','Выключить туннель')])
+            if selected: action(ui,'Туннель VPN','vpn',selected)
+        elif choice=='selection': vpn_selection(ui)
+        elif choice=='profiles': vpn_profiles(ui)
+        elif choice=='measure': vpn_measurements(ui)
+        elif choice=='status': operation(ui,'VPN status',['/usr/local/bin/e-dev','vpn','status'])
+
+
+def certificates(ui):
+    while True:
+        rows=json.loads(output('incus','config','trust','list','--format=json'))
+        visible=[c for c in rows if c.get('name')!='lxconsole']
+        choice=ui.menu('Incus · сертификаты','Публичный .crt добавляется на Pi; приватный .pfx остаётся в браузере.\nСлужебный сертификат LXConsole защищён от удаления.',
+                       [('add','Добавить публичный .crt')]+[(c['fingerprint'],str(c.get('name') or 'Без имени')+' · '+c['fingerprint'][:12]) for c in visible])
+        if choice is None: return
+        if choice=='add':
+            path=ui.file('Публичный сертификат .crt')
+            if path is None: continue
+            name=ui.input('Имя сертификата','Имя браузера / устройства:',P.Path(path).stem)
+            if name: action(ui,'Сертификат Incus','cert-add',path,name)
+        else:
+            cert=next(c for c in visible if c['fingerprint']==choice)
+            if ui.yes('Отозвать сертификат?',str(cert.get('name') or 'Без имени')+'\n'+choice+'\nЭтот браузер потеряет доступ к Incus UI.'):
+                action(ui,'Сертификат Incus','cert-remove',choice)
+
+
+def access_menu(ui):
+    labels={'ssh':'SSH','ui':'LXConsole','files':'Файлы SMB','incus':'Incus UI · сертификат'}
+    while True:
+        state=json.loads(output(ACTIONS,'access-state'))
+        choice=ui.menu('Доступ и пароли','Пароль Wi-Fi находится в AP → Wi-Fi.\nIncus UI использует сертификаты.',
+                       [(n,label+' · '+('ВКЛ' if state[n] else 'ВЫКЛ')) for n,label in labels.items()]+
+                       [('password-all','Общий новый пароль · SSH, UI, SMB, AP'),
+                        ('all-on','Включить доступ ко всем сервисам'),('all-off','Выключить доступ ко всем сервисам')])
+        if choice is None: return
+        if choice=='password-all': password(ui,'all')
+        elif choice in ('all-on','all-off'):
+            enable=choice=='all-on'
+            if not ui.yes('Изменить весь доступ?', 'Включить все сервисы?' if enable else 'Выключить SSH, обе панели и SMB?\nПовторный вход по SSH станет недоступен. Включить можно с локальной консоли.\nКонтейнеры и AP продолжат работать.'):
+                continue
+            action(ui,'Доступ','access','all','on' if enable else 'off')
+        else:
+            selected=ui.menu(labels[choice],'Доступ '+('включён' if state[choice] else 'выключен'),
+                             [('toggle','Выключить доступ' if state[choice] else 'Включить доступ')]+
+                             ([('certs','Доверенные сертификаты')] if choice=='incus' else [('password','Сменить пароль')]))
+            if selected=='password': password(ui,choice)
+            elif selected=='certs': certificates(ui)
+            elif selected=='toggle':
+                if choice=='ssh' and state[choice] and not ui.yes('Выключить SSH?',
+                    'Новые SSH-подключения будут недоступны.\nДля включения используйте монитор и клавиатуру на Pi.'):
+                    continue
+                action(ui,'Доступ','access',choice,'off' if state[choice] else 'on')
+
+
+def manuals(ui):
+    while True:
+        choice=ui.menu('E-DEV · инструкция','Выберите главу. В тексте: стрелки / PgUp / PgDn, / поиск, q — назад.',CHAPTERS)
+        if choice is None: return
+        path=DOC/(choice+'.txt')
+        if not path.exists(): raise ValueError('Глава не установлена. Обновите E-DEV.')
+        S.run(['less','-R','--',str(path)])
+
+
+def root_choices():
+    plan=lan.config();state=lan.read(lan.STATE,{})
+    active=lanui.name(plan,state.get('active'),lan.inventory())
+    ports=max(0,len(plan['outputs'])-1)
+    mode={'vpn':'VPN ON','direct':'VPN OFF','hybrid':'HYBRID'}.get(text('mode'),'ЗАКРЫТ')
+    return [('lan','LAN / IN · '+active+' · резерв '+('ВКЛ' if plan['failover'] else 'ВЫКЛ')),
+            ('out','OUT · дополнительные порты: '+str(ports)),
+            ('ap','AP · '+cfg('system.json',{'ssid':'E-DEV'})['ssid']+' · '+mode),
+            ('vpn','VPN · '+text('selected-profile')+' · '+cfg('vpn-policy.json',{'mode':'manual'})['mode'].upper()),
+            ('status','Статус · живой дашборд'),('access','Доступ и пароли')]
+
+
+def main():
+    if not sys.stdin.isatty() or not sys.stdout.isatty(): raise ValueError('Откройте меню в интерактивном терминале.')
+    if not shutil.which('dialog'): raise ValueError('Нужен пакет dialog.')
+    ui=tui.Dialog()
+    if sys.argv[1:]==['manuals']: return manuals(ui)
+    if sys.argv[1:]: raise ValueError('Настройки: e-dev settings')
+    if os.geteuid()!=0: raise ValueError('Настройки требуют sudo.')
+    if not (B/'lan.json').exists() and not lanui.commit(ui,lan.config()): return
+    while True:
+        choice=ui.menu('E-DEV 1.0 · Settings',ui.logo(),root_choices())
+        if choice is None: return
+        try:
+            if choice=='lan': lan_menu(ui)
+            elif choice=='out': lanui.zone_menu(ui,'outputs')
+            elif choice=='ap': ap_menu(ui)
+            elif choice=='vpn': vpn_menu(ui)
+            elif choice=='status': S.run(['/usr/local/sbin/e-dev-dashboard'])
+            elif choice=='access': access_menu(ui)
+        except (ValueError,OSError,S.SubprocessError) as error:
+            ui.message('Ошибка',str(error))
+
+
+if __name__=='__main__':
+    try: main()
+    except (ValueError,OSError,S.SubprocessError) as error:
+        print(str(error),file=sys.stderr);sys.exit(1)
+    except KeyboardInterrupt: pass
+    finally: S.run(['clear'])

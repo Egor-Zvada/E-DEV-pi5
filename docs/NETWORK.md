@@ -26,7 +26,7 @@
 
 Подсеть AP хранится в `/etc/e-dev/wifi.json`; сети контейнеров фиксированы. LAN берётся из подключённых kernel routes физических интерфейсов при `vpn boot/on`, смене AP-режима или подсети AP. Чужой туннель не добавляется в список прямых локальных сетей. Настройки исходного AWG-конфига `DNS`, `Table`, hooks удаляются; в runtime используется `Table=off`, IPv4 `AllowedIPs=0.0.0.0/0`. Для работы необходим userspace TUN `/dev/net/tun`.
 
-`e-dev wifi settings` меняет IPv4 Pi, подсеть, пул и аренду DHCP средствами NetworkManager. Применение запускается отдельной systemd-службой, поэтому не зависит от сохранения SSH-соединения. Перед переходом `inet e_dev_wifi_change` закрывает весь forwarded трафик `wlan0`/`edevbr0`. После активации AP обновляются source rules, guard, NAT и DNS; временный запрет снимается в конце. При ошибке восстанавливаются прежние настройки; если откат не удался, запрет сохраняется. Снимок настроек — `/opt/e-dev/backups/wifi-*`. Guard также отбрасывает IPv4 с чужим source subnet на AP/VPN-мосте.
+`e-dev settings → AP → Подсеть и DHCP` меняет IPv4 Pi, подсеть, пул и аренду DHCP средствами NetworkManager. Применение запускается отдельной systemd-службой, поэтому не зависит от сохранения SSH-соединения. Перед переходом `inet e_dev_wifi_change` закрывает весь forwarded трафик `wlan0`/`edevbr0`. После активации AP обновляются source rules, guard, NAT и DNS; временный запрет снимается в конце. При ошибке восстанавливаются прежние настройки; если откат не удался, запрет сохраняется. Снимок настроек — `/opt/e-dev/backups/wifi-*`. Guard также отбрасывает IPv4 с чужим source subnet на AP/VPN-мосте.
 
 ## Защита при отказе
 
@@ -60,7 +60,7 @@ Auto ранжирует download, затем ping, и проверяет, что
 
 ## Физические IN / OUT
 
-`e-dev lan setup` управляет физическими устройствами NetworkManager через dialog. Встроенные `eth0`/`wlan0` закреплены; дополнительные привязаны к постоянному MAC, а не меняющемуся имени. `edevbr0` несёт прежний IP AP и shared DHCP; OUT-порты имеют IPv4 disabled и controller bridge. Wired OUT и AP используют одну подсеть, DNS и guard. Wi-Fi IN работает в infrastructure, OUT — AP; обычный Wi-Fi client в мост OUT не включается.
+`e-dev settings → LAN / OUT` управляет физическими устройствами NetworkManager через dialog. Встроенные `eth0`/`wlan0` закреплены; дополнительные привязаны к постоянному MAC, а не меняющемуся имени. `edevbr0` несёт прежний IP AP и shared DHCP; OUT-порты имеют IPv4 disabled и controller bridge. Wired OUT и AP используют одну подсеть, DNS и guard. Wi-Fi IN работает в infrastructure, OUT — AP; обычный Wi-Fi client в мост OUT не включается.
 
 Каждый IN сохраняет connected/default routes в собственной таблице 5000–5099. В main копируются локальные сети с protocol 241. Выбранный default имеет metric 40; постоянный blackhole default metric 41 предотвращает подхват случайного main default с обычной NM-метрикой. Проверки HTTPS привязаны к устройству и используют literal IP без DNS-зависимости. Не выбранный в основной/резерв IN не становится глобальным выходом. Отрицательный DNS priority выбранного входа исключает DNS остальных IN.
 

@@ -310,7 +310,7 @@ def main():
                 'hostname': args.hostname, 'country': args.country, 'timezone': args.timezone}
     write(BASE/'installed.json', json.dumps(manifest, indent=2)+'\n')
     (BASE/'setup-in-progress').unlink()
-    print('AP готов. Интернет AP закрыт до импорта VPN либо команды e-dev wifi off.')
+    print('AP готов. Настройки: e-dev settings. В AP выберите VPN OFF или импортируйте VPN и выберите режим.')
     print('Перезайдите в SSH, чтобы применились группа Incus, приветствие и Tab.')
 
 

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Private settings operations, called by the root terminal UI, never a shell."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib as P
+import subprocess as S
+import sys
+
+B = P.Path('/etc/e-dev')
+SERVICES = {'ssh':'ssh.service', 'ui':'lxconsole.service', 'files':'smbd.service'}
+
+
+def load(name):
+    path=P.Path('/usr/local/bin/e-dev') if name=='e-dev' else P.Path('/usr/local/sbin')/name
+    if not path.exists(): path=P.Path(__file__).with_name(name)
+    loader=importlib.machinery.SourceFileLoader(name.replace('-','_')+'_actions',str(path))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader))
+    loader.exec_module(module)
+    return module
+
+
+def call(*args, input=None):
+    result=S.run(args,text=True,capture_output=True,input=input,stdin=S.DEVNULL if input is None else None,timeout=60)
+    if result.returncode: raise ValueError('Операция не завершилась: '+args[0])
+    return result.stdout.strip()
+
+
+def access_state():
+    state = {**{key:call('systemctl','show','-p','ActiveState','--value',unit)=='active' for key,unit in SERVICES.items()},
+            'incus':call('incus','config','get','core.https_address') not in ('','127.0.0.1:8443','[::1]:8443')}
+    state['ssh'] = state['ssh'] or call('systemctl','show','-p','ActiveState','--value','ssh.socket')=='active'
+    return state
+
+
+def access(name, enable):
+    if name=='all':
+        for service in ('ui','files','incus','ssh'): access(service,enable)
+        return
+    if name=='incus':
+        call('incus','config','set','core.https_address='+(':8443' if enable else '127.0.0.1:8443'))
+    elif name in SERVICES:
+        units=[SERVICES[name]]
+        if name=='ssh' and call('systemctl','show','-p','LoadState','--value','ssh.socket')!='not-found':
+            if not enable: units+=['ssh.socket']
+        call('systemctl','enable' if enable else 'disable','--now',*units)
+    else: raise ValueError('Неизвестный сервис.')
+    print('Доступ '+('включён' if enable else 'выключен')+': '+name)
+
+
+def main(args):
+    if os.geteuid()!=0: raise ValueError('Настройки требуют sudo.')
+    cli=load('e-dev')
+    if args[0]=='vpn': cli.vpn(args[1:])
+    elif args[0]=='traffic' and args[1] in ('on','off','hybrid'):
+        cli.wvpn(args[1:])
+    elif args[0]=='check': cli.route_check(args[1])
+    elif args[0]=='hybrid': load('e-dev-hybrid').execute(args[1:])
+    elif args[0]=='radio':
+        wifi=load('e-dev-wifi');data=wifi.current();data['radio']=json.load(sys.stdin);wifi.queue(data)
+    elif args[0]=='password': cli.apply_password(args[1],json.load(sys.stdin)['password'])
+    elif args[0]=='access' and args[2] in ('on','off'): access(args[1],args[2]=='on')
+    elif args[0]=='access-state': print(json.dumps(access_state()))
+    elif args[0]=='cert-add':
+        path=P.Path(args[1])
+        if not path.is_file() or path.stat().st_size>65536: raise ValueError('Нужен небольшой публичный .crt файл.')
+        data=path.read_text()
+        if path.stat().st_size>65536 or 'PRIVATE KEY' in data or 'BEGIN CERTIFICATE' not in data:
+            raise ValueError('Нужен публичный сертификат .crt без приватного ключа.')
+        call('incus','config','trust','add-certificate',str(path),'--name='+args[2])
+        print('Сертификат добавлен.')
+    elif args[0]=='cert-remove':
+        certs=json.loads(call('incus','config','trust','list','--format=json'))
+        cert=next((c for c in certs if c['fingerprint']==args[1]),None)
+        if not cert or cert.get('name')=='lxconsole': raise ValueError('Сертификат отсутствует или используется LXConsole.')
+        call('incus','config','trust','remove',args[1]);print('Доверие сертификату отозвано.')
+    else: raise ValueError('Неизвестная операция.')
+
+
+if __name__=='__main__':
+    try: main(sys.argv[1:])
+    except (ValueError,OSError,S.SubprocessError,IndexError) as error:
+        print(str(error),file=sys.stderr);sys.exit(1)

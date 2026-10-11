@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Keep AWG daemons in their own service, independent of probe/timer lifetimes."""
+import subprocess as S, pathlib as P, sys, time
+if len(sys.argv)!=2 or sys.argv[1] not in ('awg0','edevprobe'): sys.exit(1)
+dev=sys.argv[1]
+if S.run(['systemctl','restart','e-dev-awg-go@'+dev+'.service'],capture_output=True).returncode: sys.exit(1)
+for _ in range(50):
+ if P.Path('/sys/class/net/'+dev).exists() and S.run(['awg','show',dev],capture_output=True).returncode==0: sys.exit(0)
+ time.sleep(.1)
+S.run(['systemctl','stop','e-dev-awg-go@'+dev+'.service'],capture_output=True)
+sys.exit(1)

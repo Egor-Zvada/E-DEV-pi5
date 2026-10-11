@@ -1,0 +1,20 @@
+[Unit]
+Description=LXConsole Incus web management
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+User=lxconsole
+Group=lxconsole
+WorkingDirectory=/opt/lxconsole
+EnvironmentFile=/opt/lxconsole/.env
+ExecStart=/opt/lxconsole/.venv/bin/gunicorn --bind 0.0.0.0:9443 --workers 1 --threads 8 --timeout 120 --certfile /opt/lxconsole/tls/server.crt --keyfile /opt/lxconsole/tls/server.key lxconsole:app
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

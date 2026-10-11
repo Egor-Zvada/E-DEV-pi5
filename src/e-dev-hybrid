@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Interactive hybrid settings backed by local files."""
+import pathlib as P, subprocess as S, json, ipaddress as I, sys, re, runpy, fcntl
+B=P.Path('/etc/e-dev')
+def run(*args):
+ r=S.run(args,text=True,capture_output=True)
+ if r.returncode: raise ValueError('Операция не завершилась: '+args[0])
+ if r.stdout.strip(): print(r.stdout.strip())
+def cfg():
+ p=B/'hybrid.json'
+ return json.loads(p.read_text()) if p.exists() else {'geo':True,'autoupdate':True,'dns':['1.1.1.1','8.8.8.8']}
+def save(data):
+ p=B/'hybrid.json.new';p.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n');p.chmod(0o644);p.replace(B/'hybrid.json')
+def words(name):
+ p=B/name;return sorted(set(p.read_text().split())) if p.exists() else []
+def dns_reload():
+ domains=words('direct-domains');data=cfg()
+ s='port=1053\nlisten-address=10.42.0.1\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=1000\n'
+ s+=''.join('server='+x+'@awg0\n' for x in data['dns'])
+ if domains: s+='nftset=/'+ '/'.join(domains)+'/4#inet#e_dev_split#ru4\n'
+ p=B/'dns.conf';p.write_text(s)
+ run('nft','flush','set','inet','e_dev_split','ru4')
+ run('systemctl','restart','e-dev-dns')
+ # Shared AP DNS in direct mode. Active AP is not bounced by settings changes.
+ P.Path('/etc/NetworkManager/dnsmasq-shared.d/e-dev-upstream.conf').write_text('no-resolv\n'+''.join('server='+x+'\n' for x in data['dns']))
+ # DNS interception for direct AP is separate, so this config applies on next AP activation.
+
+def apply():
+ with open('/run/e-dev-vpn.lock','w') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  runtime=runpy.run_path('/usr/local/sbin/e-dev-vpn')
+  runtime['guard'](runtime['readmode']())
+def show():
+ data=cfg();info=json.loads((B/'geo-info.json').read_text()) if (B/'geo-info.json').exists() else {}
+ print('HYBRID SETTINGS')
+ print('Режим AP: '+(B/'mode').read_text().strip())
+ print('Российская IP-база: '+('учитывается' if data['geo'] else 'выключена'))
+ print('Сетей в кэше: '+str(info.get('networks',0))+'; обновление: '+info.get('updated','нет'))
+ print('Автообновление базы: '+('ежедневно' if data['autoupdate'] else 'выключено'))
+ print('DNS: '+', '.join(data['dns']))
+ print('Прямых доменных правил: '+str(len(words('direct-domains'))))
+ print('Своих прямых IP/сетей: '+str(len(words('direct-ips'))))
+ print('Без интернета остаётся последняя сохранённая IP-база. Настройки не включают режим hybrid автоматически.')
+
+def edit(kind,action,value=None):
+ filename='direct-domains' if kind=='domains' else 'direct-ips';values=set(words(filename))
+ if action=='list': print('\n'.join(sorted(values)) or 'Список пуст.');return
+ if action not in ('add','del') or not value: raise ValueError('Нужно list, add VALUE или del VALUE.')
+ if kind=='domains':
+  value=value.lower().strip('.').encode('idna').decode('ascii')
+  if not re.fullmatch(r'[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?',value) or len(value)>253 or any(not x or len(x)>63 or x.startswith('-') or x.endswith('-') for x in value.split('.')): raise ValueError('Нужен домен без https:// и пути.')
+ else:
+  net=I.IPv4Network(value,strict=False)
+  if not net.network_address.is_global or net.prefixlen<8: raise ValueError('Нужен публичный IPv4 или CIDR не шире /8.')
+  value=str(net)
+ if action=='add': values.add(value)
+ else: values.discard(value)
+ (B/filename).write_text('\n'.join(sorted(values))+'\n')
+ if kind=='domains': dns_reload()
+ else: apply()
+ print('Правило '+('добавлено: ' if action=='add' else 'удалено: ')+value)
+
+def execute(args):
+ command=args[0]
+ if command in ('show','status'): show()
+ elif command in ('domains','ips'): edit(command,args[1] if len(args)>1 else 'list',args[2] if len(args)>2 else None)
+ elif command in ('geo','autoupdate'):
+  value=args[1] if len(args)>1 else 'status'
+  if value=='update' and command=='geo': run('/usr/local/sbin/e-dev-geo-update');return
+  if value=='status': show();return
+  if value not in ('on','off'): raise ValueError('geo/autoupdate on|off|status; geo update')
+  data=cfg();data[command]=value=='on';save(data)
+  if command=='geo': apply()
+  else: run('systemctl','enable','--now','e-dev-geo-update.timer') if value=='on' else run('systemctl','disable','--now','e-dev-geo-update.timer')
+  show()
+ elif command=='dns':
+  if len(args)==1: print(', '.join(cfg()['dns']));return
+  values=[str(I.IPv4Address(x)) for x in args[1:]]
+  if len(values)>3 or any(not I.IPv4Address(x).is_global for x in values): raise ValueError('От 1 до 3 публичных DNS IPv4.')
+  data=cfg();data['dns']=values;save(data);dns_reload()
+  print('VPN/гибрид DNS изменён. Для прямого AP новый DNS применяется при переподключении AP.')
+ elif command=='check': run('/usr/local/bin/e-dev','wifi','check',args[1])
+ else: raise ValueError('Unknown setting')
+
+def menu():
+ if not sys.stdin.isatty(): raise ValueError('Меню требует терминал. e-dev wifi hybrid settings show')
+ while True:
+  print('''\nНастройки гибрида:
+  1. Текущие настройки и возраст IP-базы
+  2. Показать прямые домены
+  3. Добавить прямой домен
+  4. Удалить прямой домен
+  5. Показать свои прямые IP/сети
+  6. Добавить прямой IP или сеть
+  7. Удалить прямой IP или сеть
+  8. Обновить российскую IP-базу
+  9. Включить/выключить учёт российской IP-базы
+ 10. Включить/выключить ежедневное обновление базы
+ 11. Изменить DNS
+ 12. Проверить маршрут домена/IP
+  0. Выход''')
+  answer=input('Выберите пункт: ').strip()
+  if answer in ('0','q',''): return
+  try:
+   if answer=='1': show()
+   elif answer=='2': edit('domains','list')
+   elif answer in ('3','4'): edit('domains','add' if answer=='3' else 'del',input('Домен: ').strip())
+   elif answer=='5': edit('ips','list')
+   elif answer in ('6','7'): edit('ips','add' if answer=='6' else 'del',input('IPv4 или сеть CIDR: ').strip())
+   elif answer=='8': execute(['geo','update'])
+   elif answer in ('9','10'):
+    name='geo' if answer=='9' else 'autoupdate';data=cfg();execute([name,'off' if data[name] else 'on'])
+   elif answer=='11': execute(['dns']+input('DNS IPv4 через пробел (например 1.1.1.1 8.8.8.8): ').split())
+   elif answer=='12': execute(['check',input('Домен или IPv4: ').strip()])
+   else: print('Нет такого пункта.')
+  except (ValueError,IndexError) as e: print(str(e))
+if __name__=='__main__':
+ try: execute(sys.argv[1:]) if len(sys.argv)>1 else menu()
+ except (ValueError,OSError) as e: print(str(e),file=sys.stderr);sys.exit(1)
+ except (KeyboardInterrupt,EOFError): print('\nМеню закрыто.')

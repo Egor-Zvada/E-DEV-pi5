@@ -1,0 +1,27 @@
+ДИАГНОСТИКА
+
+  e-dev status
+  e-dev vpn status
+  e-dev vpn speeds
+  e-dev wifi clients
+  e-dev wifi check DOMAIN/IP
+  e-dev wifi hybrid settings show
+  sudo systemctl list-timers 'e-dev-*'
+  sudo journalctl -u e-dev-vpn -u e-dev-dns -u e-dev-vpn-health -u e-dev-auto -n 50 --no-pager
+
+VPN-связь отсутствует: проверить upstream, handshake и vpn status.
+Manual не переключается сам; выберите другой через e-dev vpn manual.
+Default использует основной/резерв; Auto — результаты замеров и проверку связи.
+Сам Pi выходит напрямую. AP ON/HYBRID + VPN OFF: vpn on запускает туннель;
+wifi vpn off переводит только AP на прямой выход.
+
+Сбой Auto/Speedtest: посмотреть vpn speeds и журнал e-dev-auto.
+Неудачный тест не разрешает прямой выход для VPN-трафика.
+Без интернета автообновление RU-базы не удаляет рабочий локальный кэш.
+Если российский сервис не работает, проверить его домены/IP, обновить
+IP-базу, при необходимости добавить вспомогательные адреса сервиса.
+
+Обновления устройств Meta могут зависеть от доступности их сервисов.
+MSS AWG TCP ограничен 1360.
+Реальные приложения Ozon/WB/2ГИС, фото с iPhone и полный цикл питания
+проверяются на устройствах пользователя отдельно от маршрутизации.

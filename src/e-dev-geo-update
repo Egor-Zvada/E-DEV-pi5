@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import sys
+import pathlib as P, urllib.request as U, ipaddress as I, datetime as D, subprocess as S, json
+B=P.Path('/etc/e-dev');url='https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone'
+try:
+ if len(sys.argv)>1 and sys.argv[1]=='scheduled' and (B/'hybrid.json').exists() and not json.loads((B/'hybrid.json').read_text()).get('autoupdate',True):
+  print('Автообновление базы выключено.');sys.exit(0)
+ with U.urlopen(url,timeout=25) as r: data=r.read(2000001)
+ if len(data)>2000000: raise ValueError('Too large')
+ nets=[I.IPv4Network(x,strict=True) for x in data.decode('ascii').split()]
+ if not 1000<len(nets)<50000 or any(n.prefixlen<8 or not n.network_address.is_global for n in nets): raise ValueError('Invalid country list')
+ nets=list(I.collapse_addresses(nets));text='\n'.join(map(str,nets))+'\n'
+ # Atomic nft replacement; a failed download never changes the working set.
+ batch='flush set inet e_dev_split rusubnets\nadd element inet e_dev_split rusubnets { '+', '.join(map(str,nets))+' }\n'
+ result=S.run(['nft','-f','-'],input=batch,text=True,capture_output=True)
+ if result.returncode: raise ValueError('nft transaction failed')
+ p=B/'ru4.zone.new';p.write_text(text);p.chmod(0o644);p.replace(B/'ru4.zone')
+ (B/'geo-info.json').write_text(json.dumps({'source':url,'updated':D.datetime.now(D.timezone.utc).isoformat(),'networks':len(nets)},ensure_ascii=False)+'\n')
+ print('Российская IP-база обновлена: '+str(len(nets))+' сетей.')
+except Exception as e:
+ print('IP-база не обновлена; сохранена предыдущая версия ('+type(e).__name__+').')
+ raise SystemExit(1)

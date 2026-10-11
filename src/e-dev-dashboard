@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Read-only live terminal dashboard. Python stdlib; no daemon, API or AI."""
+import collections
+import curses
+import datetime
+import json
+import os
+import pathlib as P
+import subprocess as S
+import sys
+import time
+
+BASE = P.Path('/etc/e-dev')
+INTERFACES = ('eth0', 'wlan0', 'awg0')
+
+
+def text(path, fallback=''):
+    try:
+        return P.Path(path).read_text().strip()
+    except OSError:
+        return fallback
+
+
+def config(name, fallback):
+    try:
+        return json.loads(text(BASE/name))
+    except (ValueError, TypeError):
+        return fallback
+
+
+def command(args):
+    try:
+        return S.run(args, text=True, capture_output=True, timeout=3).stdout.strip()
+    except (OSError, S.TimeoutExpired):
+        return ''
+
+
+def cpu_percent(before, after):
+    total = sum(after)-sum(before)
+    idle = (after[3]+after[4])-(before[3]+before[4])
+    return max(0, min(100, 100*(total-idle)/total)) if total > 0 else 0
+
+
+def rate(before, after, seconds):
+    return max(0, after-before)/seconds if seconds > 0 else 0
+
+
+def human_bytes(value, suffix='B'):
+    for unit in ('', 'Ki', 'Mi', 'Gi', 'Ti'):
+        if value < 1024 or unit == 'Ti':
+            return f'{value:.1f} {unit}{suffix}'
+        value /= 1024
+
+
+def spark(values, width, ceiling=100):
+    levels = '▁▂▃▄▅▆▇█'
+    ceiling = max(ceiling, .001)
+    return ''.join(levels[min(7, max(0, int(v/ceiling*7)))] for v in list(values)[-max(1, width):])
+
+
+class Sampler:
+    def __init__(self):
+        self.previous_cpu = None
+        self.previous_net = {}
+        self.previous_time = time.monotonic()
+        self.cpu_history = collections.deque(maxlen=90)
+        self.ram_history = collections.deque(maxlen=90)
+        self.net_history = {name: collections.deque(maxlen=90) for name in INTERFACES}
+        self.last_details = -float('inf')
+        self.details = {}
+
+    def sample(self):
+        now = time.monotonic()
+        counters = [int(v) for v in text('/proc/stat', 'cpu 0 0 0 0 0 0 0 0').splitlines()[0].split()[1:9]]
+        cpu = cpu_percent(self.previous_cpu, counters) if self.previous_cpu else 0
+        self.previous_cpu = counters
+        memory = {row.split(':')[0]: int(row.split()[1])*1024 for row in text('/proc/meminfo').splitlines()}
+        total = memory.get('MemTotal', 1)
+        used = total-memory.get('MemAvailable', memory.get('MemFree', 0))
+        fs = os.statvfs('/srv/share' if P.Path('/srv/share').exists() else '/')
+        disk_total, disk_free = fs.f_blocks*fs.f_frsize, fs.f_bfree*fs.f_frsize
+        net = {}
+        for name in INTERFACES:
+            values = tuple(int(text('/sys/class/net/'+name+'/statistics/'+field, '0')) for field in ('rx_bytes', 'tx_bytes'))
+            previous = self.previous_net.get(name, values)
+            rates = [rate(a, b, now-self.previous_time) for a, b in zip(previous, values)]
+            net[name] = rates
+            self.previous_net[name] = values
+            self.net_history[name].append(sum(rates))
+        self.previous_time = now
+        self.cpu_history.append(cpu)
+        self.ram_history.append(100*used/total)
+        if now-self.last_details >= 10:
+            self.refresh_details()
+            self.last_details = now
+        return dict(self.details, cpu=cpu, mem_used=used, mem_total=total,
+                    disk_used=disk_total-disk_free, disk_total=disk_total,
+                    temperature=float(text('/sys/class/thermal/thermal_zone0/temp', '0'))/1000,
+                    uptime=float(text('/proc/uptime', '0').split()[0]), net=net,
+                    cpu_history=self.cpu_history, ram_history=self.ram_history,
+                    net_history=self.net_history,
+                    mode=text(BASE/'mode', 'vpn'), selected=text(BASE/'selected-profile', '—') or '—',
+                    enabled=text(BASE/'vpn-enabled', 'on') == 'on',
+                    tunnel=P.Path('/sys/class/net/awg0').exists(),
+                    policy=config('vpn-policy.json', {'mode': 'manual'}),
+                    system=config('system.json', {'hostname': 'E-DEV', 'ssid': 'E-DEV'}))
+
+    def refresh_details(self):
+        names = ('incus', 'lxconsole', 'smbd', 'e-dev-dns')
+        service_lines = command(['systemctl', 'is-active', *names]).splitlines()
+        services = dict(zip(names, service_lines))
+        state = command(['nmcli', '-g', 'GENERAL.STATE,GENERAL.CONNECTION', 'device', 'show', 'wlan0']).splitlines()
+        ap = bool(state and state[0].startswith('100') and 'E-DEV-AP' in state)
+        stations_args = ['iw', 'dev', 'wlan0', 'station', 'dump']
+        if os.geteuid() != 0:
+            stations_args = ['sudo', '-n', *stations_args]
+        try:
+            stations = S.run(stations_args, text=True, capture_output=True, timeout=3)
+            clients = stations.stdout.count('Station ') if stations.returncode == 0 else None
+        except (OSError, S.TimeoutExpired):
+            clients = None
+        try:
+            containers = json.loads(command(['incus', 'list', '--format=json']))
+            running = sum(row['status'] == 'Running' for row in containers)
+            count = len(containers)
+        except (ValueError, TypeError, KeyError):
+            running = count = None
+        try:
+            addresses = json.loads(command(['ip', '-j', '-4', 'addr']))
+            ips = {d['ifname']: next((a['local'] for a in d.get('addr_info', []) if a['scope'] == 'global'), '—') for d in addresses}
+        except (ValueError, TypeError, KeyError):
+            ips = {}
+        self.details = dict(services=services, ap=ap, clients=clients,
+                            running=running, containers=count, ips=ips)
+
+
+class Canvas:
+    def __init__(self, window):
+        self.window = window
+        self.height, self.width = window.getmaxyx()
+
+    def put(self, y, x, value, style=0, limit=None):
+        if y < 0 or y >= self.height or x < 0 or x >= self.width-1:
+            return
+        value = str(value).replace('\n', ' ')
+        space = self.width-x-1
+        if limit is not None:
+            space = min(space, limit)
+        try:
+            self.window.addstr(y, x, value[:max(0, space)], style)
+        except curses.error:
+            pass
+
+    def bar(self, y, x, value, width, style):
+        width = max(1, min(width, self.width-x-2))
+        filled = round(width*max(0, min(100, value))/100)
+        self.put(y, x, '━'*width, limit=width)
+        self.put(y, x, '━'*filled, style, limit=width)
+
+
+def render(window, data, page='main', colors=(0, 0, 0)):
+    canvas = Canvas(window)
+    height, width = canvas.height, canvas.width
+    accent, good, warn = colors
+    window.erase()
+    canvas.put(0, 2, 'E-DEV', accent | curses.A_BOLD)
+    canvas.put(0, 10, 'Egor Zvada · egor-zvada.ru')
+    if width >= 85:
+        canvas.put(0, width-22, datetime.datetime.now().strftime('%d.%m  %H:%M:%S'))
+    canvas.put(1, 2, '─'*(width-5), accent)
+    if width < 60 or height < 18:
+        canvas.put(3, 2, 'Для дашборда увеличьте терминал до 60×18.')
+        canvas.put(5, 2, 'Wi-Fi: '+data['mode'].upper()+' · VPN: '+data['selected'])
+        canvas.put(height-1, 2, 'q  выход')
+        window.refresh()
+        return
+    if page == 'links':
+        hostname = data['system'].get('hostname', 'E-DEV')+'.local'
+        canvas.put(3, 2, 'ПАНЕЛИ И ФАЙЛЫ', accent | curses.A_BOLD)
+        canvas.put(5, 2, 'LXConsole · пароль')
+        canvas.put(6, 4, 'https://'+hostname+':9443/')
+        canvas.put(8, 2, 'Incus UI · сертификат')
+        canvas.put(9, 4, 'https://'+hostname+':8443/ui/')
+        canvas.put(11, 2, 'Файлы · SMB')
+        canvas.put(12, 4, 'smb://'+hostname+'/Share')
+        canvas.put(14, 2, 'Через точку доступа: 10.42.0.1 · LAN: '+data.get('ips', {}).get('eth0', '—'))
+    else:
+        half = width//2
+        left_width = half-5
+        right_width = width-half-3
+        canvas.put(3, 2, 'РЕСУРСЫ', accent | curses.A_BOLD)
+        canvas.put(3, half, 'РЕЖИМЫ', accent | curses.A_BOLD)
+        canvas.put(4, 2, f"CPU  {data['cpu']:5.1f}%", limit=left_width)
+        canvas.bar(5, 2, data['cpu'], left_width, accent)
+        canvas.put(6, 2, spark(data['cpu_history'], left_width), accent, left_width)
+        mem = 100*data['mem_used']/max(1, data['mem_total'])
+        canvas.put(7, 2, 'RAM  '+human_bytes(data['mem_used'])+' / '+human_bytes(data['mem_total']), limit=left_width)
+        canvas.bar(8, 2, mem, left_width, accent)
+        canvas.put(9, 2, spark(data['ram_history'], left_width), accent, left_width)
+        canvas.put(10, 2, 'Диск '+human_bytes(data['disk_used'])+' / '+human_bytes(data['disk_total']), limit=left_width)
+        uptime = int(data['uptime'])
+        canvas.put(11, 2, f"{data['temperature']:.1f} °C · uptime {uptime//86400}д {(uptime//3600)%24}ч {(uptime//60)%60}м", limit=left_width)
+        mode = {'vpn': 'VPN', 'direct': 'DIRECT', 'hybrid': 'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
+        canvas.put(4, half, 'Wi-Fi AP   '+('ВКЛ' if data['ap'] else 'ВЫКЛ'), good if data['ap'] else warn, right_width)
+        canvas.put(5, half, 'Трафик AP  '+mode, accent | curses.A_BOLD, right_width)
+        available = data['enabled'] and data['tunnel']
+        tunnel = 'ВКЛ · интерфейс поднят' if available else 'ВКЛ · нет интерфейса' if data['enabled'] else 'ВЫКЛ'
+        canvas.put(6, half, 'Туннель    '+tunnel, good if available else warn, right_width)
+        canvas.put(7, half, 'Сервер     '+data['selected'], limit=right_width)
+        policy = data['policy']
+        canvas.put(8, half, 'Выбор      '+policy.get('mode', 'manual').upper(), limit=right_width)
+        if policy.get('mode') == 'default':
+            canvas.put(9, half, str(policy.get('primary') or '—')+' → '+str(policy.get('backup') or 'без резерва'), limit=right_width)
+        else:
+            canvas.put(9, half, 'Контейнеры VPN: тот же сервер', limit=right_width)
+        containers = '—' if data['containers'] is None else str(data['running'])+' / '+str(data['containers'])+' запущено'
+        canvas.put(10, half, 'Incus      '+containers, limit=right_width)
+        clients = '—' if data['clients'] is None else str(data['clients'])
+        canvas.put(11, half, 'Wi-Fi      '+clients+' клиентов · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
+        if height >= 24:
+            row = 13
+            canvas.put(row, 2, 'СЕТЬ · RX ↓ / TX ↑', accent | curses.A_BOLD)
+            for index, name in enumerate(INTERFACES):
+                y = row+1+index*2
+                rx, tx = data['net'].get(name, (0, 0))
+                canvas.put(y, 2, f'{name:6}  ↓ {human_bytes(rx, "B/s"):>11}  ↑ {human_bytes(tx, "B/s"):>11}', limit=half-4)
+                hist = data['net_history'][name]
+                canvas.put(y, half, spark(hist, right_width, max(hist, default=1)), accent, right_width)
+                canvas.put(y+1, 2, data.get('ips', {}).get(name, '—'))
+        services = data.get('services', {})
+        summary = '  '.join(label+' '+('●' if services.get(name) == 'active' else '○') for name, label in [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
+        canvas.put(height-3, 2, summary, good)
+        canvas.put(height-2, 2, 'Контейнеры default → провайдер · vpn → выбранный туннель', limit=width-5)
+    canvas.put(height-1, 2, 'q выход   l ссылки   r обновить   ·  2 с', accent)
+    window.refresh()
+
+
+def main(window):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    colors = (0, 0, 0)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        for number, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW), 1):
+            curses.init_pair(number, foreground, -1)
+        colors = tuple(curses.color_pair(i) for i in (1, 2, 3))
+    window.timeout(200)
+    sampler = Sampler()
+    page = 'main'
+    next_sample = 0
+    data = None
+    while True:
+        if time.monotonic() >= next_sample:
+            data = sampler.sample()
+            next_sample = time.monotonic()+2
+        render(window, data, page, colors)
+        key = window.getch()
+        if key in (ord('q'), ord('Q'), 27):
+            return
+        if key in (ord('l'), ord('L')):
+            page = 'links' if page == 'main' else 'main'
+        if key in (ord('r'), ord('R')):
+            sampler.last_details = -float('inf')
+            next_sample = 0
+
+
+if __name__ == '__main__':
+    if not sys.stdout.isatty():
+        raise SystemExit('Дашборду нужен терминал. Текстовый статус: e-dev status --once')
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

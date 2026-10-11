@@ -1,0 +1,9 @@
+[Unit]
+Description=E-DEV autonomous daily Ookla VPN ranking
+After=e-dev-vpn.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/e-dev-policy auto-daily
+TimeoutStartSec=30min

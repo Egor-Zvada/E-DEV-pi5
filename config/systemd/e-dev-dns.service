@@ -1,0 +1,12 @@
+[Unit]
+Description=E-DEV VPN DNS with split routing sets
+After=e-dev-vpn.service NetworkManager.service
+Wants=e-dev-vpn.service
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/e-dev/dns.conf --pid-file=
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

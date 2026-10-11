@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""E-DEV local control. Root-owned; no arbitrary shell execution."""
+import time, ipaddress, fcntl, contextlib
+import sys, os, subprocess as sp, pathlib as P, json, re, getpass, tempfile, shutil
+BASE=P.Path('/etc/e-dev'); DOC=P.Path('/opt/e-dev/docs'); STATE=BASE/'mode'; PROFILES=BASE/'profiles'
+def system_config():
+    p=BASE/'system.json';return json.loads(p.read_text()) if p.exists() else {'user':'user','hostname':'E-DEV','ssid':'E-DEV'}
+def local_user(): return system_config()['user']
+def run(args, **kw): return sp.run(args, text=True, **kw)
+def out(args):
+    r=run(args,stdout=sp.PIPE,stderr=sp.DEVNULL)
+    return r.stdout.strip() if r.returncode==0 else ''
+def fail(s): print(s,file=sys.stderr); sys.exit(1)
+def mode(): return STATE.read_text().strip() if STATE.exists() else 'blocked'
+def selected():
+    p=BASE/'selected-profile'; return p.read_text().strip() if p.exists() else 'не выбран'
+def ips():
+    try:
+        return [(d['ifname'],a['local']) for d in json.loads(out(['ip','-j','-4','addr'])) for a in d.get('addr_info',[]) if a['scope']=='global']
+    except Exception: return []
+def links():
+    print('Панели одного Incus; контейнеры общие.\n')
+    addresses=[('Имя в локальной сети',system_config()['hostname']+'.local')]+[(n,a) for n,a in ips() if n in ('eth0','wlan0') or n.startswith('wl')]
+    for n,a in addresses:
+        print(f'{n}:\n  LXConsole ({local_user()} + пароль): https://{a}:9443/\n  Incus UI (сертификат):     https://{a}:8443/ui/\n  Файлы ({local_user()} + пароль):    smb://{a}/Share')
+    print('\nIP по DHCP может меняться. Имя .local требует mDNS. Через AP используйте 10.42.0.1.')
+def status():
+    if sys.stdout.isatty():
+        sys.exit(run(['/usr/local/sbin/e-dev-dashboard']).returncode)
+    return status_text()
+def status_text():
+    print('E-DEV | мини dev-сервер')
+    print('Wi-Fi:',{'blocked':'выход закрыт','direct':'напрямую через провайдера','vpn':'через VPN','hybrid':'российские IP и исключения напрямую, остальные VPN'}.get(mode(),mode()))
+    print('VPN-профиль:',selected())
+    print('Выбор сервера:',vpn_config()['mode'].upper())
+    print('Туннель:', 'интерфейс поднят' if P.Path('/sys/class/net/awg0').exists() else 'выключен / недоступен')
+    print('AP:',out(['nmcli','-g','GENERAL.STATE','device','show','wlan0']))
+    for s in ('incus','lxconsole','smbd','e-dev-guard','e-dev-dns'):
+        print(s+':',out(['systemctl','is-active',s]))
+    t=P.Path('/sys/class/thermal/thermal_zone0/temp')
+    if t.exists(): print('CPU: %.1f °C'%(int(t.read_text())/1000))
+    stats=out(['free','-m']).splitlines()
+    if len(stats)>1:
+        values=stats[1].split();print('RAM: '+values[2]+' / '+values[1]+' MiB')
+    disk=shutil.disk_usage('/srv/share' if P.Path('/srv/share').exists() else '/');print('Диск: %.1f / %.1f GiB'%(disk.used/2**30,disk.total/2**30))
+def welcome():
+    if not sys.stdout.isatty(): return
+    width=shutil.get_terminal_size((80,24)).columns
+    banner=DOC/('logo-small.txt' if width<76 else 'logo.txt')
+    if banner.exists():
+        print('\033[38;2;174;186;196m'+banner.read_text().rstrip()+'\033[0m')
+    print('\nEgor Zvada  •  E-DEV  •  egor-zvada.ru')
+    print('Wi-Fi: '+{'blocked':'выход закрыт','direct':'DIRECT · точка без VPN','vpn':'VPN','hybrid':'HYBRID · российские IP и исключения напрямую, остальные VPN'}.get(mode(),mode()))
+    print('Подсказки: e-dev help  |  Состояние: e-dev status  |  Ссылки: e-dev links\n')
+    for n,a in ips():
+        if n in ('eth0','wlan0'): print(f'{n}: пароль https://{a}:9443/  |  сертификат https://{a}:8443/ui/')
+    print()
+def help_(topic=None):
+    if topic=='wvpn': topic='wifi'
+    if not topic:
+        print((DOC/'wiki'/'index.txt').read_text()); return
+    if topic=='all': path=DOC/'E-DEV-guide.md'
+    else:
+        if not re.fullmatch('[a-z]+',topic): fail('e-dev help vpn|wifi|panels|files|passwd|containers|troubleshoot|all')
+        path=DOC/'wiki'/(topic+'.txt')
+    if not path.exists(): fail('Нет такого раздела. e-dev help')
+    if sys.stdout.isatty(): run(['less','-R',str(path)])
+    else: print(path.read_text())
+def root():
+    if os.geteuid()!=0: os.execvp('sudo',['sudo','--','/usr/local/bin/e-dev']+sys.argv[1:])
+@contextlib.contextmanager
+def policy_lock():
+    with open('/run/e-dev-policy.lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        yield
+
+def wvpn(args):
+    sub=args[0] if args else 'status'
+    if sub=='status': return wifi_status()
+    if sub=='vpn':
+        if len(args)!=2 or args[1] not in ('on','off'): fail('e-dev wifi vpn on|off')
+        sub=args[1];args=[sub]
+    if sub=='mode':
+        if len(args)==1:
+            if not sys.stdin.isatty(): fail('e-dev wifi mode vpn|direct|hybrid')
+            print('Маршрут Wi-Fi (сама точка остаётся включённой):\n  1. VPN\n  2. DIRECT — провайдер\n  3. HYBRID — российские сервисы напрямую')
+            choice=input('Выберите 1/2/3: ').strip()
+            value={'1':'vpn','2':'direct','3':'hybrid'}.get(choice)
+        else: value=args[1] if len(args)==2 else None
+        if value not in ('vpn','direct','hybrid'): fail('e-dev wifi mode vpn|direct|hybrid')
+        sub={'vpn':'on','direct':'off','hybrid':'hybrid'}[value];args=[sub]
+    if sub=='hybrid' and len(args)>1 and args[1] in ('settings','setting'):
+        root(); sys.exit(run(['/usr/local/sbin/e-dev-hybrid']+args[2:]).returncode)
+    root(); PROFILES.mkdir(mode=0o700,exist_ok=True)
+    if sub=='update':
+        sys.exit(run(['/usr/local/sbin/e-dev-geo-update']).returncode)
+    if sub=='check':
+        if len(args)!=2: fail('e-dev wifi check DOMAIN или IP')
+        return route_check(args[1])
+    if sub=='bypass':
+        sys.exit(run(['/usr/local/sbin/e-dev-hybrid','domains']+args[1:]).returncode)
+    if sub in ('off','on','hybrid'):
+        sys.exit(run(['/usr/local/sbin/e-dev-vpn',sub]).returncode)
+    if sub=='profiles':
+        names=sorted(p.stem for p in PROFILES.glob('*.conf'))
+        config=json.loads((BASE/'vpn-policy.json').read_text()) if (BASE/'vpn-policy.json').exists() else {}
+        for n in names:
+            roles=[label for key,label in [('primary','основной'),('backup','резерв')] if config.get(key)==n]
+            print((' * ' if n==selected() else '   ')+n+(' ['+', '.join(roles)+']' if roles else ''))
+        if not names: print('Конфиги пока не импортированы.')
+        return
+    if sub in ('import','use'):
+        if len(args)<2 or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}',args[1]): fail('Имя: буквы, цифры, - или _, максимум 32 символа.')
+        name=args[1]
+        if sub=='import':
+            if len(args)!=3: fail('Использование: e-dev vpn add NAME FILE')
+            with policy_lock():
+                source=P.Path(args[2]).resolve()
+                if not source.is_file() or source.stat().st_size>65536: fail('Нужен обычный небольшой .conf файл.')
+                data=source.read_text()
+                if not all(x in data for x in ('[Interface]','[Peer]','PrivateKey','PublicKey','Endpoint')): fail('Это не полный клиентский конфиг AWG.')
+                if re.search(r'^\s*(PreUp|PostUp|PreDown|PostDown|SaveConfig)\s*=',data,re.M|re.I): fail('Конфиги с командами Pre/PostUp/Down или SaveConfig не импортируются.')
+                destination=PROFILES/(name+'.conf'); destination.write_text(data); destination.chmod(0o600)
+                (BASE/'profile-names').write_text('\n'.join(sorted(p.stem for p in PROFILES.glob('*.conf')))+'\n')
+                (BASE/'profile-names').chmod(0o644)
+                print('Конфиг сохранён:',name,'(ключи скрыты)')
+                if name==selected() and (not (BASE/'vpn-enabled').exists() or (BASE/'vpn-enabled').read_text().strip()=='on'):
+                    if run(['/usr/local/sbin/e-dev-vpn','use',name]).returncode: fail('Выбранный профиль не перезапущен. e-dev vpn status')
+        else:
+            if not (PROFILES/(name+'.conf')).is_file(): fail('Нет такого профиля. Сначала import.')
+            sys.exit(run(['/usr/local/sbin/e-dev-policy','manual',name]).returncode)
+        return
+    fail('Неизвестная команда. e-dev help')
+def profile_names():
+    p=BASE/'profile-names';p.write_text('\n'.join(sorted(x.stem for x in PROFILES.glob('*.conf')))+'\n');p.chmod(0o644)
+def valid_name(name):
+    if not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}',name): fail('Имя: буквы, цифры, - или _, максимум 32 символа.')
+def vpn_config():
+    p=BASE/'vpn-policy.json';return json.loads(p.read_text()) if p.exists() else {'mode':'manual','primary':None,'backup':None}
+def vpn_status():
+    root()
+    on=not (BASE/'vpn-enabled').exists() or (BASE/'vpn-enabled').read_text().strip()=='on'
+    alive=P.Path('/sys/class/net/awg0').exists()
+    print('VPN: '+('включён' if on else 'выключен')+'; профиль: '+selected())
+    print('Интерфейс awg0: '+('поднят' if alive else 'отсутствует'))
+    if alive:
+        stamps=[int(line.split()[-1]) for line in out(['awg','show','awg0','latest-handshakes']).splitlines() if line.split()]
+        last=max(stamps,default=0)
+        if last:
+            age=max(0,int(time.time())-last)
+            print('Последний успешный handshake: '+str(age)+' с назад'+(' (давно; проверьте связь)' if age>180 else ''))
+        else: print('Успешного handshake пока нет; интерфейс сам по себе не подтверждает связь.')
+        for line in out(['awg','show','awg0','transfer']).splitlines():
+            fields=line.split()
+            if len(fields)==3: print('Через туннель: получено '+fields[1]+' байт; отправлено '+fields[2]+' байт')
+    config=vpn_config();print('Выбор сервера: '+config['mode'].upper())
+    print('Основной: '+str(config.get('primary') or 'не задан')+'; резерв: '+str(config.get('backup') or 'не задан'))
+    print('Режим AP: '+mode()+' (управление: e-dev wifi)')
+    info=BASE/'geo-info.json'
+    if info.exists():
+        data=json.loads(info.read_text());print('IP-база RU: '+str(data['networks'])+' сетей; обновление UTC '+data['updated'])
+def vpn(args):
+    sub=args[0].lower() if args else 'status'
+    if sub=='status': return vpn_status()
+    root()
+    if sub in ('on','off') and len(args)==1:
+        with policy_lock():
+            sys.exit(run(['/usr/local/sbin/e-dev-vpn',{'on':'start','off':'stop'}[sub]]).returncode)
+    if sub in ('settings','default','manual','auto','speeds','selection','speedtest'):
+        sys.exit(run(['/usr/local/sbin/e-dev-policy',('status' if sub=='selection' else sub)]+args[1:]).returncode)
+    if sub in ('list','profiles'): return wvpn(['profiles'])
+    if sub=='use':
+        if len(args)!=2: fail('e-dev vpn use NAME')
+        sys.exit(run(['/usr/local/sbin/e-dev-policy','manual',args[1]]).returncode)
+    if sub in ('add','import'):
+        return wvpn([{'add':'import','import':'import','use':'use'}[sub]]+args[1:])
+    if sub=='remove' and len(args)==2:
+        with policy_lock():
+            name=args[1];valid_name(name)
+            if name in (vpn_config().get('primary'),vpn_config().get('backup')): fail('Профиль выбран основным или резервным. Сначала измените e-dev vpn default.')
+            if name==selected(): fail('Выбранный профиль удалить нельзя. Сначала e-dev vpn use ДРУГОЙ.')
+            path=PROFILES/(name+'.conf')
+            if not path.exists(): fail('Нет такого профиля.')
+            path.unlink();profile_names();print('Профиль удалён: '+name);return
+    if sub=='rename' and len(args)==3:
+        with policy_lock():
+            old,new=args[1:];valid_name(old);valid_name(new)
+            source,target=PROFILES/(old+'.conf'),PROFILES/(new+'.conf')
+            if not source.is_file() or target.exists(): fail('Исходный профиль отсутствует или новое имя уже занято.')
+            source.rename(target)
+            if selected()==old: (BASE/'selected-profile').write_text(new+'\n')
+            config=vpn_config()
+            for key in ('primary','backup'):
+                if config.get(key)==old: config[key]=new
+            (BASE/'vpn-policy.json').write_text(json.dumps(config,ensure_ascii=False,indent=2)+'\n')
+            speeds=BASE/'vpn-speeds.json'
+            if speeds.exists():
+                data=json.loads(speeds.read_text());data['ranking']=[new if n==old else n for n in data.get('ranking',[])]
+                for row in data.get('results',[]):
+                    if row.get('name')==old: row['name']=new
+                speeds.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
+            profile_names();print('Профиль переименован: '+old+' → '+new);return
+    fail('e-dev help vpn')
+def set_contains(name,addr):
+    return run(['nft','get','element','inet','e_dev_split',name,'{ '+str(addr)+' }'],stdout=sp.DEVNULL,stderr=sp.DEVNULL).returncode==0
+
+def route_check(host):
+    root()
+    try: addresses=[str(ipaddress.IPv4Address(host))]
+    except ValueError:
+        host=host.strip('.').encode('idna').decode('ascii')
+        if not re.fullmatch(r'[a-zA-Z0-9.-]{1,253}',host) or host.startswith('-'): fail('Нужен домен без https:// и пути.')
+        text=out(['dig','+short','+time=3','+tries=1','@10.42.0.1','-p','1053',host,'A'])
+        addresses=[]
+        for line in text.splitlines():
+            try: addresses.append(str(ipaddress.IPv4Address(line)))
+            except ValueError: pass
+    if not addresses: fail('DNS не вернул IPv4. Проверьте e-dev vpn status и e-dev-dns.')
+    for addr in addresses:
+        settings=BASE/'hybrid.json';geo=json.loads(settings.read_text()).get('geo',True) if settings.exists() else True
+        ru=geo and set_contains('rusubnets',addr);domain=set_contains('ru4',addr);custom=set_contains('custom4',addr)
+        direct=mode()=='direct' or (mode()=='hybrid' and (ru or domain or custom))
+        reason='свой IP/сеть' if custom else 'RU IP-база' if ru else 'доменное исключение' if domain else 'общий маршрут'
+        print(host+' → '+addr+' → '+('провайдер' if direct else 'VPN')+' ('+reason+')')
+    print('Это проверка выбора маршрута AP, не проверка открытия приложения.')
+
+def password(service):
+    if service not in ('all','ssh','files','wifi','ui'): fail('Выберите all, ssh, files, wifi или ui.')
+    root()
+    if not sys.stdin.isatty(): fail('Смена пароля доступна только в интерактивном терминале.')
+    print('Incus UI входит по сертификату. all меняет SSH, SMB, Wi-Fi AP и LXConsole.')
+    p=getpass.getpass('Новый пароль: '); confirm=getpass.getpass('Повторите: ')
+    if p!=confirm or not 8<=len(p)<=63 or any(ord(c)<32 or ord(c)>126 for c in p): fail('Пароли должны совпадать: 8–63 печатных ASCII-символа.')
+    tasks=('ssh','files','ui','wifi') if service=='all' else (service,)
+    for t in tasks:
+        if t=='ssh': r=run(['chpasswd'],input=local_user()+':'+p+'\n')
+        elif t=='files': r=run(['smbpasswd','-s',local_user()],input=p+'\n'+p+'\n',stdout=sp.DEVNULL)
+        elif t=='wifi':
+            r=run(['nmcli','con','modify','E-DEV-AP','wifi-sec.psk',p],stdout=sp.DEVNULL)
+            if r.returncode==0:
+                print('Пароль AP сохранён. При следующем переподключении понадобится новый пароль.')
+                r=run(['nmcli','con','up','E-DEV-AP'],stdout=sp.DEVNULL)
+        else:
+            code="from lxconsole import app,db,bcrypt; from lxconsole.models import User; import sys\nwith app.app_context():\n u=User.query.filter_by(username=sys.argv[1]).one(); u.password=bcrypt.generate_password_hash(sys.stdin.read()).decode(); db.session.commit()\n"
+            r=run(['runuser','-u','lxconsole','--','/opt/lxconsole/.venv/bin/python','-c',code,local_user()],cwd='/opt/lxconsole',input=p,stdout=sp.DEVNULL)
+        if r.returncode: fail('Не удалось обновить '+t+'. Уже выполненные изменения сохраняются.')
+        print('Пароль обновлён:',t)
+def wifi_status():
+    cfg=system_config();policy=vpn_config()
+    state=out(['nmcli','-g','GENERAL.STATE','device','show','wlan0'])
+    connection=out(['nmcli','-g','GENERAL.CONNECTION','device','show','wlan0'])
+    active=state.startswith('100') and connection=='E-DEV-AP'
+    print('Wi-Fi AP: '+('ВКЛЮЧЕНА' if active else 'НЕ АКТИВНА')+' · '+cfg.get('ssid','E-DEV'))
+    print('Режим трафика: '+{'vpn':'VPN — весь интернет через VPN','direct':'DIRECT — через провайдера','hybrid':'HYBRID — российские IP/исключения напрямую, остальное VPN'}.get(mode(),mode()))
+    on=(BASE/'vpn-enabled').read_text().strip()=='on' if (BASE/'vpn-enabled').exists() else True
+    iface=P.Path('/sys/class/net/awg0').exists()
+    print('VPN-туннель: '+('ВКЛЮЧЁН' if on else 'ВЫКЛЮЧЕН')+'; интерфейс '+('поднят' if iface else 'отсутствует'))
+    print('VPN-сервер: '+selected()+'; выбор: '+policy['mode'].upper())
+    if policy['mode']=='default': print('Основной: '+str(policy.get('primary') or '—')+'; резерв: '+str(policy.get('backup') or '—'))
+    print('Адрес AP: 10.42.0.1 · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
+    if mode()!='direct' and not (on and iface): print('VPN-выход закрыт. Для прямого выхода AP: e-dev wifi vpn off')
+
+def wifi_clients():
+    root()
+    result=run(['iw','dev','wlan0','station','dump'],stdout=sp.PIPE,stderr=sp.PIPE)
+    if result.returncode: fail('Не удалось прочитать клиентов AP: '+result.stderr.strip())
+    leases={}
+    lease=P.Path('/var/lib/NetworkManager/dnsmasq-wlan0.leases')
+    if lease.exists():
+        for line in lease.read_text().splitlines():
+            fields=line.split()
+            if len(fields)>=4: leases[fields[1].lower()]=(fields[2],fields[3])
+    neighbors={}
+    try:
+        for entry in json.loads(out(['ip','-j','-4','neigh','show','dev','wlan0']) or '[]'):
+            if entry.get('lladdr'): neighbors[entry['lladdr'].lower()]=entry['dst']
+    except ValueError: pass
+    stations=[]
+    for block in re.split(r'^Station ',result.stdout,flags=re.M)[1:]:
+        mac=block.split()[0].lower()
+        addr,name=leases.get(mac,(neighbors.get(mac,'—'),'—'))
+        if name=='*': name='—'
+        def field(label):
+            m=re.search(r'^\s*'+re.escape(label)+r':\s*(.+)$',block,re.M)
+            return m.group(1).strip() if m else '—'
+        stations.append(mac)
+        print(f'{addr:16} {mac}  имя: {name}')
+        print('  скорость к клиенту: '+field('tx bitrate')+'; от клиента: '+field('rx bitrate')+'; сигнал: '+field('signal'))
+    print('Подключено к E-DEV: '+str(len(stations)))
+    old=[(mac,addr,name) for mac,(addr,name) in leases.items() if mac not in stations]
+    if old:
+        print('\nDHCP-записи без текущего подключения (не входят в счётчик):')
+        for mac,addr,name in old: print(f'  {addr:16} {mac}  '+('—' if name=='*' else name))
+
+def main():
+    args=sys.argv[1:]; cmd=args[0].lower() if args else 'help'
+    if cmd=='status' and args[1:]==['--once']: status_text()
+    elif cmd in ('help','man'): help_(args[1].lower() if len(args)>1 else None)
+    elif cmd=='wifi':
+        if args[1:]==['clients']: wifi_clients()
+        else: wvpn(args[1:])
+    elif cmd=='links': links()
+    elif cmd=='status': status()
+    elif cmd=='welcome': welcome()
+    elif cmd=='wvpn': wvpn(args[1:])
+    elif cmd=='vpn': vpn(args[1:])
+    elif cmd=='speedtest': vpn(['speedtest'])
+    elif cmd=='passwd': password(args[1].lower() if len(args)>1 else 'all')
+    elif cmd=='containers': run(['incus','list'])
+    elif cmd=='container' and len(args)==3 and args[1] in ('start','stop'):
+        if not re.fullmatch('[a-zA-Z0-9_-]+',args[2]): fail('Некорректное имя.')
+        sys.exit(run(['incus',args[1],args[2]]).returncode)
+    elif cmd=='docs': run(['less',str(DOC/'E-DEV-guide.md')])
+    else: fail('Неизвестная команда. e-dev help')
+if __name__=='__main__':
+    try: main()
+    except (OSError,ValueError,sp.CalledProcessError) as e: fail(str(e))
+    except KeyboardInterrupt: fail('Отменено.')

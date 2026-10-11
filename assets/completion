@@ -1,0 +1,50 @@
+_e_dev_complete() {
+ [[ "${COMP_WORDS[1],,}" == wvpn ]] && COMP_WORDS[1]=wifi
+ local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1],,}" sub="${COMP_WORDS[2],,}" third="${COMP_WORDS[3],,}" fourth="${COMP_WORDS[4],,}" fifth="${COMP_WORDS[5],,}" words=""
+ COMPREPLY=()
+ case "$COMP_CWORD" in
+  1) words="help man status links welcome wifi vpn speedtest passwd containers container docs" ;;
+  2) case "$cmd" in
+      help|man) words="vpn wifi panels files passwd containers troubleshoot all" ;;
+      vpn) words="status on off list settings default manual auto speeds selection speedtest use add remove rename" ;;
+      wifi|wvpn) words="status vpn mode hybrid check update bypass clients" ;;
+
+      passwd) words="all ssh files wifi ui" ;;
+      container) words="start stop" ;;
+     esac ;;
+  3) case "$cmd:$sub" in
+      vpn:settings) words="default manual auto" ;;
+      vpn:auto) words="run" ;;
+      vpn:default|vpn:manual|vpn:use|vpn:remove|vpn:rename|wifi:use) words="$(cat /etc/e-dev/profile-names 2>/dev/null)" ;;
+      wifi:hybrid) words="settings" ;;
+      wifi:vpn) words="on off" ;;
+      wifi:mode) words="vpn direct hybrid" ;;
+      status:*) words="--once" ;;
+      wifi:bypass) words="list add del" ;;
+      container:start|container:stop) words="$(incus list --format csv -c n </dev/null 2>/dev/null)" ;;
+     esac ;;
+  4) case "$cmd:$sub" in
+      wifi:import|vpn:add|vpn:import) mapfile -t COMPREPLY < <(compgen -f -- "$cur"); compopt -o filenames; return ;;
+      vpn:default) words="$(cat /etc/e-dev/profile-names 2>/dev/null) -" ;;
+      vpn:settings) [[ "$third" == default || "$third" == manual ]] && words="$(cat /etc/e-dev/profile-names 2>/dev/null)" ;;
+      wifi:hybrid) [[ "$third" == settings || "$third" == setting ]] && words="show domains ips geo autoupdate dns check" ;;
+      wifi:bypass) [[ "$third" == del ]] && words="$(cat /etc/e-dev/direct-domains 2>/dev/null)" ;;
+     esac ;;
+  5) if [[ "$cmd:$sub:$third" == vpn:settings:default ]]; then
+      words="$(cat /etc/e-dev/profile-names 2>/dev/null) -"
+     elif [[ "$cmd:$sub" == wifi:hybrid ]]; then
+      case "$fourth" in
+       domains|ips) words="list add del" ;;
+       geo) words="on off status update" ;;
+       autoupdate) words="on off status" ;;
+       dns) words="1.1.1.1 8.8.8.8" ;;
+      esac
+     fi ;;
+  6) if [[ "$cmd:$sub" == wifi:hybrid && "$fifth" == del ]]; then
+      [[ "$fourth" == domains ]] && words="$(cat /etc/e-dev/direct-domains 2>/dev/null)"
+      [[ "$fourth" == ips ]] && words="$(cat /etc/e-dev/direct-ips 2>/dev/null)"
+     fi ;;
+ esac
+ mapfile -t COMPREPLY < <(compgen -W "$words" -- "$cur")
+}
+complete -F _e_dev_complete e-dev E-DEV E-dev edev

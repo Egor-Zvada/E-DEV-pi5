@@ -1,0 +1,10 @@
+[Unit]
+Description=E-DEV AmneziaWG userspace daemon %i
+After=NetworkManager.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/amneziawg-go -f %i
+Environment=LOG_LEVEL=error
+Restart=no
+TimeoutStopSec=10

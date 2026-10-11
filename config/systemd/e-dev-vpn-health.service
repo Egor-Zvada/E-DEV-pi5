@@ -1,0 +1,9 @@
+[Unit]
+Description=E-DEV autonomous VPN availability and failover
+After=e-dev-vpn.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/e-dev-policy health
+TimeoutStartSec=5min

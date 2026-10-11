@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""E-DEV routing and tunnel lifecycle: independent controls, fail closed."""
+import pathlib as P, subprocess as S, sys, re, fcntl, ipaddress, json, os
+B=P.Path('/etc/e-dev')
+def call(*a,check=True,input=None):
+ env=dict(os.environ,WG_QUICK_USERSPACE_IMPLEMENTATION='/usr/local/sbin/e-dev-awg-launch') if a[0]=='awg-quick' else None
+ return S.run(a,input=input,text=True,stdout=S.PIPE,stderr=S.PIPE,check=check,env=env)
+def save(name,value):
+ p=B/(name+'.new');p.write_text(value+'\n');p.chmod(0o644);p.replace(B/name)
+def enabled(): return not (B/'vpn-enabled').exists() or (B/'vpn-enabled').read_text().strip()=='on'
+def readmode():
+ mode=(B/'mode').read_text().strip()
+ return mode if mode in ('vpn','direct','hybrid') else 'vpn'
+def local_routes():
+ # Internal networks are fixed; the physical LAN comes from current kernel routes.
+ routes=[('10.42.0.0/24','wlan0'),('10.43.0.0/24','vpnbr0'),('10.158.92.0/24','incusbr0')]
+ try:
+  result=call('ip','-j','-4','route','show','table','main',check=False)
+  for row in json.loads(result.stdout or '[]'):
+   dev=row.get('dev','');dst=row.get('dst','default')
+   if row.get('scope')!='link' or row.get('protocol')!='kernel' or dst=='default': continue
+   if dev not in ('eth0','wlan0','vpnbr0','incusbr0') and not dev.startswith(('wl','en')): continue
+   net=str(ipaddress.IPv4Network(dst,strict=False))
+   if (net,dev) not in routes: routes.append((net,dev))
+ except (ValueError,OSError): pass
+ return routes
+
+def rules(mode):
+ nets='{ 10.43.0.0/24, 10.42.0.0/24 }' if mode!='direct' else '10.43.0.0/24'
+ allowed='ip daddr { '+', '.join(sorted(set(net for net,dev in local_routes())))+' } accept\n  oifname "awg0" accept' if mode!='blocked' else ''
+ if mode=='hybrid': allowed='ip saddr 10.42.0.0/24 meta mark 0x42 accept\n  '+allowed
+ dns='10.42.0.1:1053' if mode!='blocked' else '1.1.1.1'
+ return '''table inet e_dev_guard {
+ chain forward { type filter hook forward priority -10; policy accept;
+  ip saddr NETS jump protect
+  iifname { "wlan0", "vpnbr0" } meta nfproto ipv6 drop
+ }
+ chain protect { ALLOWED
+  counter drop
+ }
+ chain dns { type nat hook prerouting priority dstnat - 10; policy accept;
+  ip saddr NETS udp dport 53 dnat ip to DNSDEST
+  ip saddr NETS tcp dport 53 dnat ip to DNSDEST
+ }
+ chain mss { type filter hook forward priority mangle; policy accept;
+  oifname "awg0" tcp flags & (syn | rst) == syn tcp option maxseg size > 1360 tcp option maxseg size set 1360 counter
+  iifname "awg0" tcp flags & (syn | rst) == syn tcp option maxseg size > 1360 tcp option maxseg size set 1360 counter
+ }
+ chain nat { type nat hook postrouting priority srcnat + 10; policy accept;
+  ip saddr { 10.42.0.0/24, 10.43.0.0/24 } oifname "awg0" masquerade
+ }
+}'''.replace('DNSDEST',dns).replace('NETS',nets).replace('ALLOWED',allowed)+'\n'
+def geo_load():
+ p=B/'ru4.zone'
+ if not p.exists(): return
+ nets=[str(ipaddress.IPv4Network(x)) for x in p.read_text().split()]
+ if not nets: raise ValueError('Empty IP list')
+ call('nft','-f','-',input='flush set inet e_dev_split rusubnets\nadd element inet e_dev_split rusubnets { '+', '.join(nets)+' }\n')
+def hybrid_cfg():
+ p=B/'hybrid.json'
+ return json.loads(p.read_text()) if p.exists() else {'geo':True,'autoupdate':True,'dns':['1.1.1.1','8.8.8.8']}
+def custom_load():
+ p=B/'direct-ips'
+ nets=[str(ipaddress.IPv4Network(x)) for x in p.read_text().split()] if p.exists() else []
+ batch='flush set inet e_dev_split custom4\n'
+ if nets: batch+='add element inet e_dev_split custom4 { '+', '.join(nets)+' }\n'
+ call('nft','-f','-',input=batch)
+def split(mode):
+ exists=call('nft','list','table','inet','e_dev_split',check=False).returncode==0
+ if not exists:
+  call('nft','-f','-',input='add table inet e_dev_split\nadd set inet e_dev_split ru4 { type ipv4_addr; flags timeout; timeout 1h; }\nadd chain inet e_dev_split classify { type filter hook prerouting priority mangle; policy accept; }\n')
+ if call('nft','list','set','inet','e_dev_split','rusubnets',check=False).returncode:
+  call('nft','-f','-',input='add set inet e_dev_split rusubnets { type ipv4_addr; flags interval; auto-merge; }\n')
+  geo_load()
+ if call('nft','list','set','inet','e_dev_split','custom4',check=False).returncode:
+  call('nft','-f','-',input='add set inet e_dev_split custom4 { type ipv4_addr; flags interval; auto-merge; }\n')
+ custom_load()
+ batch='flush chain inet e_dev_split classify\n'
+ if mode=='hybrid':
+  for name in (['rusubnets'] if hybrid_cfg()['geo'] else [])+['ru4','custom4']:
+   batch+='add rule inet e_dev_split classify ip saddr 10.42.0.0/24 ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter\n'
+  batch+='add rule inet e_dev_split classify ct mark 0x42 meta mark set 0x42\n'
+ call('nft','-f','-',input=batch)
+def guard(mode):
+ split(mode)
+ data=rules(mode)
+ exists=call('nft','list','table','inet','e_dev_guard',check=False).returncode==0
+ call('nft','-f','-',input=('delete table inet e_dev_guard\n' if exists else '')+data)
+ p=B/'ap-guard.nft.new';p.write_text(data);p.replace(B/'ap-guard.nft')
+def routes(mode):
+ call('sysctl','-w','net.ipv4.conf.all.src_valid_mark=1')
+ for priority in ('10419','10422'):
+  while call('ip','rule','del','priority',priority,check=False).returncode==0: pass
+ call('ip','rule','add','priority','10422','oif','awg0','lookup','1042')
+ if mode=='hybrid': call('ip','rule','add','priority','10419','from','10.42.0.0/24','fwmark','0x42','lookup','main')
+ call('ip','route','replace','blackhole','default','metric','32760','table','1042')
+ # Keep both default routes in place while removing stale connected LAN routes.
+ try:
+  previous=json.loads(call('ip','-j','-4','route','show','table','1042',check=False).stdout or '[]')
+  for row in previous:
+   if row.get('dst') not in (None,'default'): call('ip','route','del',row['dst'],'table','1042',check=False)
+ except ValueError: pass
+ for net,dev in local_routes():
+  call('ip','route','replace',net,'dev',dev,'table','1042',check=False)
+ for priority,net in [('10420','10.42.0.0/24'),('10421','10.43.0.0/24')]:
+  while call('ip','rule','del','priority',priority,check=False).returncode==0: pass
+  if net=='10.43.0.0/24' or mode!='direct': call('ip','rule','add','priority',priority,'from',net,'lookup','1042')
+def down():
+ call('awg-quick','down','awg0',check=False)
+ call('systemctl','stop','e-dev-awg-go@awg0.service',check=False)
+ call('ip','route','del','default','dev','awg0','table','1042',check=False)
+def tunnel(name):
+ if not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}',name): raise ValueError('Invalid profile')
+ source=B/'profiles'/(name+'.conf');data=[]
+ for line in source.read_text().splitlines():
+  key=line.split('=',1)[0].strip().lower()
+  if key in ('dns','table','preup','postup','predown','postdown','saveconfig'): continue
+  if key=='allowedips': line='AllowedIPs = 0.0.0.0/0'
+  data.append(line)
+  if line.strip()=='[Interface]': data.append('Table = off')
+ down()
+ p=P.Path('/etc/amnezia/amneziawg/awg0.conf');p.write_text('\n'.join(data)+'\n');p.chmod(0o600)
+ call('awg-quick','up','awg0')
+ call('sysctl','-w','net.ipv4.conf.all.rp_filter=2','net.ipv4.conf.awg0.rp_filter=2')
+ call('ip','route','replace','default','dev','awg0','metric','10','table','1042')
+def main():
+ with open('/run/e-dev-vpn.lock','w') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  command=sys.argv[1] if len(sys.argv)>1 else 'boot'
+  mode=readmode();name=(B/'selected-profile').read_text().strip()
+  if command in ('on','off','hybrid'):
+   mode={'on':'vpn','off':'direct','hybrid':'hybrid'}[command]
+   guard('blocked' if mode!='direct' else 'direct');routes(mode);guard(mode);save('mode',mode)
+  elif command in ('stop','shutdown'):
+   if command=='stop': save('vpn-enabled','off')
+   guard('blocked' if mode!='direct' else 'direct');down();routes(mode);guard(mode)
+  elif command in ('start','boot','use'):
+   if command=='start': save('vpn-enabled','on')
+   if command in ('start','boot') and (B/'vpn-policy.json').exists():
+    policy=json.loads((B/'vpn-policy.json').read_text())
+    primary=policy.get('primary')
+    if policy.get('mode')=='default' and primary and (B/'profiles'/(primary+'.conf')).is_file(): name=primary
+   if command=='use':
+    name=sys.argv[2]
+    if not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}',name) or not (B/'profiles'/(name+'.conf')).is_file(): raise ValueError('Unknown profile')
+   guard('blocked' if mode!='direct' else 'direct');routes(mode)
+   if enabled(): tunnel(name)
+   else: down()
+   guard(mode);save('selected-profile',name)
+   call('systemctl','--no-block','try-restart','e-dev-dns.service',check=False)
+   if command in ('start','boot') and (B/'vpn-policy.json').exists() and json.loads((B/'vpn-policy.json').read_text()).get('mode')=='auto' and enabled():
+    call('systemctl','--no-block','start','e-dev-auto.service',check=False)
+  elif command=='geo-load': split(mode);geo_load()
+  else: raise ValueError('Unknown operation')
+  print('AP: '+mode+'; VPN: '+('on' if enabled() else 'off')+'; профиль: '+name)
+if __name__=='__main__':
+ try: main()
+ except Exception as e:
+  print('Операция не завершена. VPN-трафик остаётся закрытым при отсутствии туннеля. Проверьте journalctl -u e-dev-vpn.',file=sys.stderr)
+  sys.exit(1)

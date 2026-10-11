@@ -1,0 +1,12 @@
+ПАРОЛИ
+
+  e-dev passwd all            SSH, SMB, Wi-Fi AP и LXConsole
+  e-dev passwd ssh            SSH пользователя user
+  e-dev passwd files          SMB user
+  e-dev passwd wifi           пароль точки E-DEV
+  e-dev passwd ui             LXConsole user
+
+Команда запросит sudo, затем новый пароль дважды. Ввод скрыт.
+Минимум 8 символов. Incus UI использует сертификат и пароля не имеет.
+Изменение all последовательное: при сбое предыдущие изменения сохраняются.
+Изменение Wi-Fi переподключает AP. Пароли в справочнике не сохраняются.

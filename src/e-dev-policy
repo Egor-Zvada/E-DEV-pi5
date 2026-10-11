@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""VPN selection, isolated probes and measured daily ranking. No secret logs."""
+import pathlib as P, subprocess as S, json, sys, time, fcntl, re, hashlib, contextlib, datetime, os, signal
+B=P.Path('/etc/e-dev');R='/usr/local/sbin/e-dev-vpn'
+def run(*args,check=False,input=None,timeout=None):
+ env=dict(os.environ,WG_QUICK_USERSPACE_IMPLEMENTATION='/usr/local/sbin/e-dev-awg-launch') if args[0]=='awg-quick' else None
+ return S.run(args,text=True,input=input,stdout=S.PIPE,stderr=S.PIPE,check=check,timeout=timeout,env=env)
+def read(name,default):
+ p=B/name
+ return json.loads(p.read_text()) if p.exists() else default
+
+def save(name,value):
+ p=B/(name+'.new');p.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n');p.chmod(0o644);p.replace(B/name)
+def cfg(): return read('vpn-policy.json',{'mode':'manual','primary':None,'backup':None})
+def selected(): return (B/'selected-profile').read_text().strip()
+def enabled(): return not (B/'vpn-enabled').exists() or (B/'vpn-enabled').read_text().strip()=='on'
+def profiles(): return sorted(p.stem for p in (B/'profiles').glob('*.conf'))
+def alive(): return P.Path('/sys/class/net/awg0').exists()
+def valid(name):
+ if name not in profiles(): raise ValueError('Нет профиля '+name+'. e-dev vpn list')
+def switch(name):
+ valid(name)
+ result=run(R,'use',name,timeout=35)
+ if result.returncode: raise ValueError('Не удалось запустить профиль '+name+'; проверьте e-dev vpn status.')
+ print(result.stdout.strip())
+
+def identity(name):
+ vals=[]
+ for line in (B/'profiles'/(name+'.conf')).read_text().splitlines():
+  if line.partition('=')[0].strip().lower() in ('privatekey','publickey','endpoint'): vals.append(line.strip())
+ return hashlib.sha256('\n'.join(vals).encode()).hexdigest()
+
+@contextlib.contextmanager
+def interface(name):
+ if name==selected() or (enabled() and identity(name)==identity(selected())):
+  # Never start a second client with the same credentials at the same peer.
+  yield 'awg0';return
+ dev='edevprobe';path=P.Path('/etc/amnezia/amneziawg')/(dev+'.conf')
+ try:
+  data=[]
+  for line in (B/'profiles'/(name+'.conf')).read_text().splitlines():
+   key=line.partition('=')[0].strip().lower()
+   if key in ('dns','table','preup','postup','predown','postdown','saveconfig'): continue
+   if key=='allowedips': line='AllowedIPs = 0.0.0.0/0'
+   data.append(line)
+   if line.strip()=='[Interface]': data.append('Table = off')
+  path.write_text('\n'.join(data)+'\n');path.chmod(0o600)
+  run('awg-quick','down',dev,timeout=12)
+  run('systemctl','stop','e-dev-awg-go@'+dev+'.service',timeout=12)
+  while run('ip','rule','del','priority','10424').returncode==0: pass
+  run('awg-quick','up',dev,check=True,timeout=12)
+  run('sysctl','-w','net.ipv4.conf.'+dev+'.rp_filter=2',check=True)
+  run('ip','route','replace','blackhole','default','metric','32760','table','1044',check=True)
+  run('ip','route','replace','default','dev',dev,'metric','10','table','1044',check=True)
+  run('ip','rule','add','priority','10424','oif',dev,'lookup','1044',check=True)
+  yield dev
+ finally:
+  run('ip','rule','del','priority','10424')
+  run('awg-quick','down',dev,timeout=12)
+  run('systemctl','stop','e-dev-awg-go@'+dev+'.service',timeout=12)
+  run('ip','route','flush','table','1044')
+  path.unlink(missing_ok=True)
+
+def probe(dev):
+ for url in ('https://1.1.1.1/cdn-cgi/trace','https://1.0.0.1/cdn-cgi/trace','https://www.gstatic.com/generate_204'):
+  result=run('curl','--noproxy','*','--interface',dev,'-4','-sS','--connect-timeout','3','--max-time','5','-o','/dev/null','-w','%{http_code}',url,timeout=7)
+  if result.returncode==0 and result.stdout in ('200','204'): return True
+ return False
+
+def measure(name):
+ try:
+  with interface(name) as dev:
+   if not probe(dev): return {'name':name,'ok':False,'error':'нет связи'}
+   address=json.loads(run('ip','-j','-4','addr','show','dev',dev,check=True).stdout)[0]['addr_info'][0]['local']
+   result=run('/usr/local/bin/speedtest','--accept-license','--accept-gdpr','--interface='+dev,'--format=json','--progress=no',timeout=150)
+   if result.returncode:
+    errors=re.findall(r'\[error\]\s*(.+)',result.stderr)
+    return {'name':name,'ok':False,'error':'Speedtest: '+(errors[-1][:160] if errors else 'замер не завершился')}
+   data=json.loads(result.stdout)
+   if data.get('type')!='result' or data.get('interface',{}).get('internalIp')!=address:
+    return {'name':name,'ok':False,'error':'Speedtest не подтвердил привязку к туннелю'}
+   return {'name':name,'ok':True,'mbps':round(float(data['download']['bandwidth'])*8/1000000,3),'upload_mbps':round(float(data['upload']['bandwidth'])*8/1000000,3),'ping_ms':round(float(data['ping']['latency']),1),'bytes':data['download'].get('bytes',0)+data['upload'].get('bytes',0),'server':data.get('server',{}).get('name',''),'server_id':data.get('server',{}).get('id')}
+ except Exception: return {'name':name,'ok':False,'error':'профиль недоступен или ошибка замера'}
+
+def results():
+ data=read('vpn-speeds.json',{})
+ if not data: print('Замеров пока нет. e-dev vpn auto run');return
+ print('Последний замер: '+data.get('local_time','—'))
+ for row in data.get('results',[]):
+  print(row['name']+': '+(str(row['mbps'])+' Мбит/с ↓; '+str(row.get('upload_mbps','—'))+' Мбит/с ↑; ping '+str(row.get('ping_ms','—'))+' мс' if row['ok'] else row.get('error','недоступен')))
+ print('Ookla Speedtest; выбор по download, при равенстве — меньший ping. Полный тест расходует трафик; результат относится к моменту замера.')
+
+def active_speedtest():
+ if not enabled() or not alive(): raise ValueError('Активного VPN нет. e-dev vpn on')
+ name=selected();print('Speedtest через активный VPN '+name+'…',flush=True)
+ row=measure(name)
+ save('vpn-active-speed.json',{'local_time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'result':row})
+ if not row['ok']: raise ValueError(row['error']+'; профиль и режим выбора сохранены.')
+ print(name+': '+str(row['mbps'])+' Мбит/с ↓; '+str(row['upload_mbps'])+' Мбит/с ↑; ping '+str(row['ping_ms'])+' мс')
+ print('Сервер Speedtest: '+row['server']+'; трафик теста: '+str(round(row['bytes']/1000000,1))+' MB')
+ print('VPN-профиль и режим выбора не изменены.')
+
+def auto(force=False,apply_cached=False):
+ config=cfg()
+ if config['mode']!='auto': print('Auto не выбран; ежедневный замер пропущен.');return
+ if not enabled(): print('VPN выключен; замер пропущен.');return
+ data=read('vpn-speeds.json',{})
+ today=datetime.datetime.now().astimezone().date().isoformat()
+ if not force and data.get('day')==today:
+  print('Сегодня уже измеряли; используется сохранённый рейтинг.')
+  if apply_cached:
+   for name in data.get('ranking',[]):
+    if name not in profiles(): continue
+    try:
+     with interface(name) as dev: ok=probe(dev)
+    except Exception: ok=False
+    if ok:
+     if name!=selected() or not alive(): switch(name)
+     print('Auto выбрал по сохранённому рейтингу: '+name);return
+   print('Доступный профиль из рейтинга не найден; текущий выбор сохранён.')
+  return
+ rows=[]
+ for name in profiles():
+  print('Измеряю '+name+'…',flush=True);row=measure(name);rows.append(row)
+  print(name+': '+(str(row['mbps'])+' Мбит/с' if row['ok'] else row['error']),flush=True)
+ ranked=sorted((r for r in rows if r['ok']),key=lambda r:(-r['mbps'],r.get('ping_ms',float('inf'))))
+ ranking=[r['name'] for r in ranked] if ranked else [n for n in data.get('ranking',[]) if n in profiles()]
+ save('vpn-speeds.json',{'engine':'Ookla Speedtest','day':today,'local_time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'results':rows,'ranking':ranking,'ranking_day':today if ranked else data.get('ranking_day',data.get('day'))})
+ if ranked:
+  winner=ranked[0]['name']
+  if winner!=selected() or not alive(): switch(winner)
+  print('Auto выбрал: '+winner)
+ else: print('Успешных замеров нет; текущий профиль сохранён. Прямой fallback не включается.')
+
+def health():
+ config=cfg()
+ if config['mode']=='manual' or not enabled(): return
+ if not alive():
+  try: switch(selected())
+  except (ValueError,S.SubprocessError): pass
+ state=read('vpn-health.json',{'failures':0,'last_primary_check':0})
+ good=probe('awg0')
+ if good:
+  state['failures']=0
+  if config['mode']=='default' and config.get('primary') in profiles() and selected()!=config['primary'] and time.time()-state.get('last_primary_check',0)>900:
+   state['last_primary_check']=time.time()
+   try:
+    with interface(config['primary']) as dev: primary_ok=probe(dev)
+   except Exception: primary_ok=False
+   if primary_ok: switch(config['primary']);print('Вернулся основной профиль.')
+ else:
+  state['failures']=state.get('failures',0)+1
+  if state['failures']>=3:
+   candidates=[config.get('primary'),config.get('backup')] if config['mode']=='default' else read('vpn-speeds.json',{}).get('ranking',[])+profiles()
+   seen=set()
+   for name in candidates:
+    if not name or name not in profiles() or name==selected() or name in seen: continue
+    seen.add(name)
+    try:
+     with interface(name) as dev: ok=probe(dev)
+    except Exception: ok=False
+    if ok:
+     switch(name);state['failures']=0;state['last_primary_check']=time.time();print('Переключение на доступный профиль: '+name);break
+ save('vpn-health.json',state)
+
+def choose(label,options,current=None,empty=False):
+ if not sys.stdin.isatty(): raise ValueError('Для меню нужен интерактивный терминал; используйте команду с именами профилей.')
+ if not options and not empty: raise ValueError('Профилей пока нет. e-dev vpn add NAME FILE')
+ print(label)
+ if empty: print('  0. Без резерва')
+ for i,name in enumerate(options,1): print('  '+str(i)+'. '+name+(' (сейчас выбран)' if name==current else ''))
+ default=str(options.index(current)+1) if current in options else '0' if empty else '1'
+ while True:
+  answer=input('Номер или имя ['+default+']: ').strip() or default
+  if empty and answer in ('0','-'): return None
+  if answer in options: return answer
+  if answer.isdigit() and 1<=int(answer)<=len(options): return options[int(answer)-1]
+  print('Выберите вариант из списка.')
+
+def set_mode(args):
+ config=cfg();mode=args[0]
+ if len(args)>({'default':3,'manual':2,'auto':1}.get(mode,0)): raise ValueError('e-dev vpn default [MAIN [RESERVE|-]] | manual [NAME] | auto')
+ if mode=='default':
+  primary=args[1] if len(args)>1 else choose('Основной VPN:',profiles(),config.get('primary') or selected())
+  valid(primary)
+  other=[n for n in profiles() if n!=primary]
+  backup=args[2] if len(args)>2 else choose('Резервный VPN:',other,config.get('backup'),empty=True) if len(args)==1 else None
+  if backup=='-': backup=None
+  if backup: valid(backup)
+  if backup==primary: raise ValueError('Основной и резервный должны различаться.')
+  config.update(mode=mode,primary=primary,backup=backup)
+ elif mode=='manual':
+  name=args[1] if len(args)>1 else choose('Единственный выбранный VPN:',profiles(),selected())
+  valid(name);config['mode']=mode
+ elif mode=='auto': config['mode']=mode
+ else: raise ValueError('Unknown selection mode')
+ save('vpn-policy.json',config);save('vpn-health.json',{'failures':0,'last_primary_check':0})
+ if mode=='default':
+  if primary!=selected() or enabled() and not alive(): switch(primary)
+  print('DEFAULT: основной '+primary+'; резерв '+str(backup or 'нет'))
+ elif mode=='manual':
+  switch(name)
+  print('MANUAL: '+name+'; автоматических переключений нет.')
+ else:
+  print('AUTO: ежедневный выбор по измеренной загрузке.');auto(apply_cached=True)
+
+def show():
+ config=cfg();print('Выбор VPN: '+config['mode'].upper())
+ print('Основной: '+str(config.get('primary') or 'не задан')+'; резерв: '+str(config.get('backup') or 'не задан'))
+ print('Текущий профиль: '+selected())
+ results()
+
+def main(args):
+ if args[0] in ('status','speeds'):
+  show() if args[0]=='status' else results();return
+ with open('/run/e-dev-policy.lock','w') as lock:
+  # Health skips a busy controller; the daily job waits, then checks mode/date.
+  if args[0]=='health':
+   try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   except BlockingIOError: return
+  else: fcntl.flock(lock,fcntl.LOCK_EX)
+  command=args[0]
+  if command=='settings': set_mode(args[1:] if len(args)>1 else [choose('Режим выбора сервера:',['default','manual','auto'],cfg()['mode'])])
+  elif command in ('default','manual','auto'):
+   if command=='auto' and len(args)>1 and args[1]=='run': auto(force=True)
+   elif command=='default' and len(args)==1 and cfg().get('primary') in profiles():
+    config=cfg();set_mode(['default',config['primary'],config.get('backup') or '-'])
+   else: set_mode(args)
+  elif command=='auto-daily': auto()
+  elif command=='health': health()
+  elif command=='speedtest': active_speedtest()
+  elif command=='status': show()
+  elif command=='speeds': results()
+  else: raise ValueError('Unknown command')
+if __name__=='__main__':
+ def terminated(signum,frame): raise KeyboardInterrupt
+ signal.signal(signal.SIGTERM,terminated)
+ try: main(sys.argv[1:] or ['status'])
+ except (ValueError,OSError,S.SubprocessError) as e: print(str(e),file=sys.stderr);sys.exit(1)
+ except (KeyboardInterrupt,EOFError): print('Меню закрыто без завершения выбора.');sys.exit(1)

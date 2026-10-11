@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh Russian IPv4 routing database
+After=network-online.target e-dev-vpn.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/e-dev-geo-update scheduled

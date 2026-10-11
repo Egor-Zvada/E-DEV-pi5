@@ -1,0 +1,32 @@
+E-DEV — справочник домашнего сервера
+Egor Zvada • E-DEV • egor-zvada.ru
+
+  e-dev status                 живой дашборд (q — выход, l — ссылки)
+  e-dev status --once          короткий текстовый статус
+  e-dev links                  актуальные панели и файлообмен
+  e-dev wifi clients           число клиентов Wi-Fi, IP и MAC
+  e-dev wifi status             точка, режим трафика, VPN-сервер
+  e-dev vpn on|off|status       включение и выключение самого туннеля
+  e-dev vpn settings           меню выбора default / manual / auto
+  e-dev vpn manual             меню выбора одного сервера
+  e-dev vpn settings default   меню выбора основного и резерва
+  e-dev vpn auto               включить Auto и измерить профили
+  e-dev speedtest              скорость через активный VPN без переключения
+  e-dev wifi hybrid settings   меню настроек гибрида
+  e-dev passwd all             общий новый пароль сервисов
+
+Разделы (стрелки / PgUp / PgDn, /поиск, q — выход):
+  e-dev help vpn               туннель, Auto и управление профилями
+  e-dev help wifi              режимы AP, гибрид, IP-база, клиенты
+  e-dev help panels            LXConsole и Incus UI
+  e-dev help files             файлы с Mac/iPhone
+  e-dev help passwd            смена паролей
+  e-dev help containers        прямые и VPN-контейнеры, ARM/x86
+  e-dev help troubleshoot      диагностика
+  e-dev help all               вся инструкция
+  man e-dev                    системная man-страница
+
+Tab дополняет команды, имена профилей, контейнеры и пути конфигов.
+Имена команды: e-dev, E-DEV, E-dev, edev. e-d + Tab → e-dev.
+Дашборд status обновляется каждые 2 с: q — выход, l — ссылки, r — обновить.
+wifi vpn on/off меняет маршрут AP, vpn on/off — сам туннель.

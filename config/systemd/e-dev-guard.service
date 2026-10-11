@@ -1,0 +1,11 @@
+[Unit]
+Description=E-DEV AP VPN safety guard
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/e-dev/ap-guard.nft
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

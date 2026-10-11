@@ -1,0 +1,15 @@
+[Unit]
+Description=E-DEV selected AmneziaWG and policy routing
+After=NetworkManager.service incus.service e-dev-guard.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+ExecStart=/usr/local/sbin/e-dev-vpn boot
+ExecStop=/usr/local/sbin/e-dev-vpn shutdown
+
+[Install]
+WantedBy=multi-user.target

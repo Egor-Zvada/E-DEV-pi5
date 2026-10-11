@@ -11,9 +11,12 @@ def enabled(): return not (B/'vpn-enabled').exists() or (B/'vpn-enabled').read_t
 def readmode():
  mode=(B/'mode').read_text().strip()
  return mode if mode in ('vpn','direct','hybrid') else 'vpn'
+def ap_interface():
+ p=B/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
+ return ipaddress.IPv4Interface(cfg.get('address','10.42.0.1/24'))
 def local_routes():
- # Internal networks are fixed; the physical LAN comes from current kernel routes.
- routes=[('10.42.0.0/24','wlan0'),('10.43.0.0/24','vpnbr0'),('10.158.92.0/24','incusbr0')]
+ # AP comes from settings; the physical LAN comes from current kernel routes.
+ routes=[(str(ap_interface().network),'wlan0'),('10.43.0.0/24','vpnbr0'),('10.158.92.0/24','incusbr0')]
  try:
   result=call('ip','-j','-4','route','show','table','main',check=False)
   for row in json.loads(result.stdout or '[]'):
@@ -26,12 +29,15 @@ def local_routes():
  return routes
 
 def rules(mode):
- nets='{ 10.43.0.0/24, 10.42.0.0/24 }' if mode!='direct' else '10.43.0.0/24'
+ ap=ap_interface();subnet=str(ap.network)
+ nets='{ 10.43.0.0/24, '+subnet+' }' if mode!='direct' else '10.43.0.0/24'
  allowed='ip daddr { '+', '.join(sorted(set(net for net,dev in local_routes())))+' } accept\n  oifname "awg0" accept' if mode!='blocked' else ''
- if mode=='hybrid': allowed='ip saddr 10.42.0.0/24 meta mark 0x42 accept\n  '+allowed
- dns='10.42.0.1:1053' if mode!='blocked' else '1.1.1.1'
+ if mode=='hybrid': allowed='ip saddr '+subnet+' meta mark 0x42 accept\n  '+allowed
+ dns=str(ap.ip)+':1053' if mode!='blocked' else '1.1.1.1'
  return '''table inet e_dev_guard {
  chain forward { type filter hook forward priority -10; policy accept;
+  iifname "wlan0" ip saddr != APNET counter drop
+  iifname "vpnbr0" ip saddr != 10.43.0.0/24 counter drop
   ip saddr NETS jump protect
   iifname { "wlan0", "vpnbr0" } meta nfproto ipv6 drop
  }
@@ -47,9 +53,9 @@ def rules(mode):
   iifname "awg0" tcp flags & (syn | rst) == syn tcp option maxseg size > 1360 tcp option maxseg size set 1360 counter
  }
  chain nat { type nat hook postrouting priority srcnat + 10; policy accept;
-  ip saddr { 10.42.0.0/24, 10.43.0.0/24 } oifname "awg0" masquerade
+  ip saddr { APNET, 10.43.0.0/24 } oifname "awg0" masquerade
  }
-}'''.replace('DNSDEST',dns).replace('NETS',nets).replace('ALLOWED',allowed)+'\n'
+}'''.replace('DNSDEST',dns).replace('NETS',nets).replace('ALLOWED',allowed).replace('APNET',subnet)+'\n'
 def geo_load():
  p=B/'ru4.zone'
  if not p.exists(): return
@@ -78,7 +84,7 @@ def split(mode):
  batch='flush chain inet e_dev_split classify\n'
  if mode=='hybrid':
   for name in (['rusubnets'] if hybrid_cfg()['geo'] else [])+['ru4','custom4']:
-   batch+='add rule inet e_dev_split classify ip saddr 10.42.0.0/24 ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter\n'
+   batch+='add rule inet e_dev_split classify ip saddr '+str(ap_interface().network)+' ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter\n'
   batch+='add rule inet e_dev_split classify ct mark 0x42 meta mark set 0x42\n'
  call('nft','-f','-',input=batch)
 def guard(mode):
@@ -92,7 +98,7 @@ def routes(mode):
  for priority in ('10419','10422'):
   while call('ip','rule','del','priority',priority,check=False).returncode==0: pass
  call('ip','rule','add','priority','10422','oif','awg0','lookup','1042')
- if mode=='hybrid': call('ip','rule','add','priority','10419','from','10.42.0.0/24','fwmark','0x42','lookup','main')
+ if mode=='hybrid': call('ip','rule','add','priority','10419','from',str(ap_interface().network),'fwmark','0x42','lookup','main')
  call('ip','route','replace','blackhole','default','metric','32760','table','1042')
  # Keep both default routes in place while removing stale connected LAN routes.
  try:
@@ -102,7 +108,7 @@ def routes(mode):
  except ValueError: pass
  for net,dev in local_routes():
   call('ip','route','replace',net,'dev',dev,'table','1042',check=False)
- for priority,net in [('10420','10.42.0.0/24'),('10421','10.43.0.0/24')]:
+ for priority,net in [('10420',str(ap_interface().network)),('10421','10.43.0.0/24')]:
   while call('ip','rule','del','priority',priority,check=False).returncode==0: pass
   if net=='10.43.0.0/24' or mode!='direct': call('ip','rule','add','priority',priority,'from',net,'lookup','1042')
 def down():

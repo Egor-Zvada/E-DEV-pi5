@@ -1,0 +1,8 @@
+[Unit]
+Description=E-DEV AP network and DHCP settings transaction
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-wifi apply
+TimeoutStartSec=180

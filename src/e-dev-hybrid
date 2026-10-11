@@ -15,7 +15,8 @@ def words(name):
  p=B/name;return sorted(set(p.read_text().split())) if p.exists() else []
 def dns_reload():
  domains=words('direct-domains');data=cfg()
- s='port=1053\nlisten-address=10.42.0.1\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=1000\n'
+ wifi=B/'wifi.json';ap=I.IPv4Interface(json.loads(wifi.read_text()).get('address','10.42.0.1/24') if wifi.exists() else '10.42.0.1/24')
+ s='port=1053\nlisten-address='+str(ap.ip)+'\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=1000\n'
  s+=''.join('server='+x+'@awg0\n' for x in data['dns'])
  if domains: s+='nftset=/'+ '/'.join(domains)+'/4#inet#e_dev_split#ru4\n'
  p=B/'dns.conf';p.write_text(s)

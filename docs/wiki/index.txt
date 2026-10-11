@@ -6,6 +6,7 @@ Egor Zvada • E-DEV • egor-zvada.ru
   e-dev links                  актуальные панели и файлообмен
   e-dev wifi clients           число клиентов Wi-Fi, IP и MAC
   e-dev wifi status             точка, режим трафика, VPN-сервер
+  e-dev wifi settings          меню подсети AP и DHCP
   e-dev vpn on|off|status       включение и выключение самого туннеля
   e-dev vpn settings           меню выбора default / manual / auto
   e-dev vpn manual             меню выбора одного сервера
@@ -28,5 +29,7 @@ Egor Zvada • E-DEV • egor-zvada.ru
 
 Tab дополняет команды, имена профилей, контейнеры и пути конфигов.
 Имена команды: e-dev, E-DEV, E-dev, edev. e-d + Tab → e-dev.
-Дашборд status обновляется каждые 2 с: q — выход, l — ссылки, r — обновить.
+Дашборд status: ASCII-логотип, графики и режимы; показатели каждые 2 с.
+q — выход, l — ссылки, r — обновить, p — пауза/продолжение бегущей строки.
+Логотип: компактный от 80 столбцов, полный сбоку от 128×24.
 wifi vpn on/off меняет маршрут AP, vpn on/off — сам туннель.

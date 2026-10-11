@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""AP network/DHCP settings; changes survive a disconnected SSH session."""
+import contextlib
+import fcntl
+import ipaddress as I
+import json
+import os
+import pathlib as P
+import runpy
+import subprocess as S
+import sys
+import time
+
+B = P.Path('/etc/e-dev')
+REQUEST = P.Path('/run/e-dev-wifi-request.json')
+BACKUPS = P.Path('/opt/e-dev/backups')
+CONNECTION = 'E-DEV-AP'
+PRIVATE = [I.IPv4Network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+CONTAINERS = [I.IPv4Network(n) for n in ('10.43.0.0/24', '10.158.92.0/24')]
+
+
+def call(*args, input=None):
+    return S.run(args, text=True, capture_output=True, input=input,
+                 stdin=S.DEVNULL if input is None else None, timeout=45, check=True).stdout.strip()
+
+
+def save(path, data, mode=0o644):
+    new = path.with_name(path.name+'.new')
+    new.write_text(json.dumps(data, ensure_ascii=False, indent=2)+'\n')
+    new.chmod(mode)
+    new.replace(path)
+
+
+@contextlib.contextmanager
+def lock(name):
+    with open('/run/'+name+'.lock', 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def current():
+    values = call('nmcli', '-g', 'ipv4.addresses,ipv4.shared-dhcp-range,ipv4.shared-dhcp-lease-time',
+                  'connection', 'show', CONNECTION).split('\n')
+    if len(values) != 3 or not values[0]:
+        raise ValueError('У AP должен быть один настроенный IPv4 с маской.')
+    return dict(address=values[0], dhcp_range=values[1], lease=int(values[2]))
+
+
+def validate(data, routes):
+    ap = I.IPv4Interface(data['address'])
+    net = ap.network
+    if not 16 <= net.prefixlen <= 28 or not any(net.subnet_of(n) for n in PRIVATE):
+        raise ValueError('Нужна частная сеть 10/8, 172.16/12 или 192.168/16 с маской /16–/28.')
+    if ap.ip in (net.network_address, net.broadcast_address):
+        raise ValueError('Адрес Pi не может быть адресом сети или broadcast.')
+    occupied = list(CONTAINERS)
+    for row in routes:
+        if row.get('dev') == 'wlan0' or row.get('dst', 'default') == 'default':
+            continue
+        occupied.append(I.IPv4Network(row['dst'], strict=False))
+    if any(net.overlaps(n) for n in occupied):
+        raise ValueError('Подсеть пересекается с LAN, VPN или сетью контейнеров. Выберите другую.')
+    pool = data.get('dhcp_range', '')
+    if pool:
+        parts = pool.split(',')
+        if len(parts) != 2:
+            raise ValueError('DHCP: два IPv4-адреса, начало и конец диапазона.')
+        start, end = map(I.IPv4Address, parts)
+        if start not in net or end not in net or not net.network_address < start <= end < net.broadcast_address:
+            raise ValueError('Диапазон DHCP должен находиться внутри подсети без network/broadcast.')
+        if start <= ap.ip <= end:
+            raise ValueError('Диапазон DHCP не должен включать адрес самой Pi.')
+    lease = int(data.get('lease', 0))
+    if lease != 0 and not 120 <= lease <= 31536000:
+        raise ValueError('DHCP lease: 0 (час по умолчанию) или 120–31536000 секунд.')
+    return dict(address=str(ap), dhcp_range=pool, lease=lease)
+
+
+def kernel_routes():
+    return json.loads(call('ip', '-j', '-4', 'route', 'show', 'table', 'main'))
+
+
+def show():
+    data = current()
+    ap = I.IPv4Interface(data['address'])
+    print('Wi-Fi AP · wlan0')
+    print('Адрес Pi: '+str(ap)+'; подсеть: '+str(ap.network))
+    print('DHCP: '+(data['dhcp_range'].replace(',', ' — ') or 'автоматический диапазон NetworkManager'))
+    print('Аренда DHCP: '+str(data['lease'] or 3600)+' с')
+    state = call('systemctl', 'show', '-p', 'ActiveState', '-p', 'Result', 'e-dev-wifi-apply.service')
+    if 'ActiveState=activating' in state:
+        print('Применение настроек ещё выполняется.')
+    elif 'Result=success' not in state:
+        print('Последнее применение не завершилось; journalctl -u e-dev-wifi-apply')
+    print('Текущие ссылки: e-dev links')
+
+
+def modify(data):
+    call('nmcli', 'connection', 'modify', CONNECTION, 'ipv4.method', 'shared',
+         'ipv4.addresses', data['address'], 'ipv4.shared-dhcp-range', data['dhcp_range'],
+         'ipv4.shared-dhcp-lease-time', str(data['lease']), 'ipv4.never-default', 'yes')
+
+
+def dns_address(address):
+    path = B/'dns.conf'
+    lines = [line for line in path.read_text().splitlines() if not line.startswith('listen-address=')]
+    lines.append('listen-address='+str(I.IPv4Interface(address).ip))
+    path.write_text('\n'.join(lines)+'\n')
+
+
+def block_ap():
+    # Block by ingress interface during the subnet transition, including spoofed sources.
+    try:
+        call('nft', 'list', 'table', 'inet', 'e_dev_wifi_change')
+        prefix = 'delete table inet e_dev_wifi_change\n'
+    except S.CalledProcessError:
+        prefix = ''
+    call('nft', '-f', '-', input=prefix+'''table inet e_dev_wifi_change {
+ chain forward { type filter hook forward priority -20; policy accept;
+  iifname "wlan0" counter drop
+ }
+}
+''')
+
+
+def unblock_ap():
+    call('nft', 'delete', 'table', 'inet', 'e_dev_wifi_change')
+
+
+def apply():
+    with lock('e-dev-wifi'), lock('e-dev-policy'), lock('e-dev-vpn'):
+        data = validate(json.loads(REQUEST.read_text()), kernel_routes())
+        old = current()
+        settings = B/'wifi.json'
+        old_settings = settings.read_text() if settings.exists() else None
+        old_dns = (B/'dns.conf').read_text()
+        backup = BACKUPS/('wifi-'+str(time.time_ns()))
+        backup.mkdir(parents=True, mode=0o700)
+        save(backup/'settings.json', dict(nm=old, wifi=old_settings, dns=old_dns), 0o600)
+        runtime = runpy.run_path('/usr/local/sbin/e-dev-vpn')
+        mode = runtime['readmode']()
+        block_ap()
+        try:
+            modify(data)
+            save(settings, data)
+            dns_address(data['address'])
+            call('nmcli', '--wait', '30', 'connection', 'up', CONNECTION)
+            runtime['routes'](mode)
+            runtime['guard'](mode)
+            call('systemctl', 'restart', 'e-dev-dns')
+            unblock_ap()
+        except Exception:
+            # A failed rollback keeps the temporary drop rule; it never opens a direct path.
+            try:
+                modify(old)
+                if old_settings is None:
+                    settings.unlink(missing_ok=True)
+                else:
+                    settings.write_text(old_settings)
+                (B/'dns.conf').write_text(old_dns)
+                call('nmcli', '--wait', '30', 'connection', 'up', CONNECTION)
+                runtime['routes'](mode)
+                runtime['guard'](mode)
+                call('systemctl', 'restart', 'e-dev-dns')
+                unblock_ap()
+                print('Ошибка применения. Предыдущие настройки восстановлены.', file=sys.stderr)
+            except Exception:
+                print('Ошибка отката. AP-трафик закрыт; восстановите настройки через Ethernet.', file=sys.stderr)
+            raise
+        finally:
+            REQUEST.unlink(missing_ok=True)
+        print('AP: '+data['address']+'; DHCP: '+(data['dhcp_range'] or 'auto')+'; режим: '+mode)
+
+
+def queue(data):
+    data = validate(data, kernel_routes())
+    with lock('e-dev-wifi'):
+        state = call('systemctl', 'show', '-p', 'ActiveState', '--value', 'e-dev-wifi-apply.service')
+        if state in ('active', 'activating', 'deactivating'):
+            raise ValueError('Предыдущее изменение ещё выполняется.')
+        save(REQUEST, data, 0o600)
+        try:
+            call('systemctl', 'start', '--no-block', 'e-dev-wifi-apply.service')
+        except Exception:
+            REQUEST.unlink(missing_ok=True)
+            raise
+    print('Настройки переданы службе. Wi-Fi-клиенты переподключатся и получат новые адреса.')
+    print('Адрес Pi после применения: '+str(I.IPv4Interface(data['address']).ip))
+    print('Результат: e-dev wifi settings show · journalctl -u e-dev-wifi-apply')
+
+
+def execute(args):
+    sub = args[0] if args else 'show'
+    if sub in ('show', 'status') and len(args) == 1:
+        return show()
+    if os.geteuid() != 0:
+        raise ValueError('Настройки меняются через e-dev wifi settings (sudo).')
+    if args == ['apply']:
+        return apply()
+    data = current()
+    if sub == 'network' and len(args) in (2, 4):
+        data.update(address=args[1], dhcp_range=','.join(args[2:]) if len(args) == 4 else '')
+    elif sub == 'dhcp' and (args[1:] == ['auto'] or len(args) == 3):
+        data['dhcp_range'] = '' if args[1:] == ['auto'] else ','.join(args[1:])
+    elif sub == 'lease' and len(args) == 2:
+        data['lease'] = int(args[1])
+    else:
+        raise ValueError('e-dev wifi settings show | network IP/MASK [START END] | dhcp auto/START END | lease SECONDS')
+    queue(data)
+
+
+def menu():
+    if not sys.stdin.isatty():
+        raise ValueError('Меню требует терминал. e-dev wifi settings show')
+    while True:
+        print('\nWi-Fi AP · сеть и DHCP\n  1. Текущие настройки\n  2. Сменить подсеть/адрес Pi\n'
+              '  3. Диапазон DHCP\n  4. Срок аренды DHCP\n  0. Выход')
+        choice = input('Выберите пункт: ').strip()
+        if choice in ('', '0', 'q'):
+            return
+        try:
+            if choice == '1':
+                show()
+                continue
+            if choice == '2':
+                args = ['network', input('Новый адрес Pi с маской, например 192.168.50.1/24: ').strip()]
+            elif choice == '3':
+                args = ['dhcp']+input('auto или начало и конец диапазона через пробел: ').split()
+            elif choice == '4':
+                args = ['lease', input('Аренда в секундах (0 = 1 час): ').strip()]
+            else:
+                print('Нет такого пункта.')
+                continue
+            print('Изменение: '+' '.join(args)+'. Точка переподключится; SSH через Wi-Fi может оборваться.')
+            if input('Применить? [y/N]: ').strip().lower() in ('y', 'yes', 'д', 'да'):
+                execute(args)
+        except (ValueError, OSError, S.SubprocessError) as error:
+            print(str(error))
+
+
+if __name__ == '__main__':
+    try:
+        execute(sys.argv[1:]) if len(sys.argv) > 1 else menu()
+    except (ValueError, OSError, S.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print('\nМеню закрыто.')

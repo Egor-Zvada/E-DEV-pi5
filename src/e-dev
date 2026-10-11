@@ -18,12 +18,16 @@ def ips():
     try:
         return [(d['ifname'],a['local']) for d in json.loads(out(['ip','-j','-4','addr'])) for a in d.get('addr_info',[]) if a['scope']=='global']
     except Exception: return []
+def management_ips(): return [(n,a) for n,a in ips() if n.startswith(('eth','en','wl'))]
+def ap_address():
+    p=BASE/'wifi.json';cfg=json.loads(p.read_text()) if p.exists() else {}
+    return str(ipaddress.IPv4Interface(cfg.get('address','10.42.0.1/24')).ip)
 def links():
     print('Панели одного Incus; контейнеры общие.\n')
-    addresses=[('Имя в локальной сети',system_config()['hostname']+'.local')]+[(n,a) for n,a in ips() if n in ('eth0','wlan0') or n.startswith('wl')]
+    addresses=management_ips()
     for n,a in addresses:
         print(f'{n}:\n  LXConsole ({local_user()} + пароль): https://{a}:9443/\n  Incus UI (сертификат):     https://{a}:8443/ui/\n  Файлы ({local_user()} + пароль):    smb://{a}/Share')
-    print('\nIP по DHCP может меняться. Имя .local требует mDNS. Через AP используйте 10.42.0.1.')
+    print('\nАдреса прочитаны с интерфейсов; после смены сети вызовите e-dev links снова.' if addresses else 'На LAN/AP сейчас нет IPv4-адресов.')
 def status():
     if sys.stdout.isatty():
         sys.exit(run(['/usr/local/sbin/e-dev-dashboard']).returncode)
@@ -35,6 +39,7 @@ def status_text():
     print('Выбор сервера:',vpn_config()['mode'].upper())
     print('Туннель:', 'интерфейс поднят' if P.Path('/sys/class/net/awg0').exists() else 'выключен / недоступен')
     print('AP:',out(['nmcli','-g','GENERAL.STATE','device','show','wlan0']))
+    for n,a in management_ips(): print(n+': '+a)
     for s in ('incus','lxconsole','smbd','e-dev-guard','e-dev-dns'):
         print(s+':',out(['systemctl','is-active',s]))
     t=P.Path('/sys/class/thermal/thermal_zone0/temp')
@@ -52,8 +57,8 @@ def welcome():
     print('\nEgor Zvada  •  E-DEV  •  egor-zvada.ru')
     print('Wi-Fi: '+{'blocked':'выход закрыт','direct':'DIRECT · точка без VPN','vpn':'VPN','hybrid':'HYBRID · российские IP и исключения напрямую, остальные VPN'}.get(mode(),mode()))
     print('Подсказки: e-dev help  |  Состояние: e-dev status  |  Ссылки: e-dev links\n')
-    for n,a in ips():
-        if n in ('eth0','wlan0'): print(f'{n}: пароль https://{a}:9443/  |  сертификат https://{a}:8443/ui/')
+    for n,a in management_ips():
+        print(f'{n}: пароль https://{a}:9443/  |  сертификат https://{a}:8443/ui/')
     print()
 def help_(topic=None):
     if topic=='wvpn': topic='wifi'
@@ -77,6 +82,9 @@ def policy_lock():
 def wvpn(args):
     sub=args[0] if args else 'status'
     if sub=='status': return wifi_status()
+    if sub=='settings':
+        if args[1:] not in (['show'],['status']): root()
+        sys.exit(run(['/usr/local/sbin/e-dev-wifi']+args[1:]).returncode)
     if sub=='vpn':
         if len(args)!=2 or args[1] not in ('on','off'): fail('e-dev wifi vpn on|off')
         sub=args[1];args=[sub]
@@ -210,7 +218,7 @@ def route_check(host):
     except ValueError:
         host=host.strip('.').encode('idna').decode('ascii')
         if not re.fullmatch(r'[a-zA-Z0-9.-]{1,253}',host) or host.startswith('-'): fail('Нужен домен без https:// и пути.')
-        text=out(['dig','+short','+time=3','+tries=1','@10.42.0.1','-p','1053',host,'A'])
+        text=out(['dig','+short','+time=3','+tries=1','@'+ap_address(),'-p','1053',host,'A'])
         addresses=[]
         for line in text.splitlines():
             try: addresses.append(str(ipaddress.IPv4Address(line)))
@@ -257,7 +265,7 @@ def wifi_status():
     print('VPN-туннель: '+('ВКЛЮЧЁН' if on else 'ВЫКЛЮЧЕН')+'; интерфейс '+('поднят' if iface else 'отсутствует'))
     print('VPN-сервер: '+selected()+'; выбор: '+policy['mode'].upper())
     if policy['mode']=='default': print('Основной: '+str(policy.get('primary') or '—')+'; резерв: '+str(policy.get('backup') or '—'))
-    print('Адрес AP: 10.42.0.1 · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
+    print('Адрес AP: '+next((a for n,a in ips() if n=='wlan0'),'нет IPv4')+' · Wi-Fi vpn off меняет маршрут, точка остаётся включённой.')
     if mode()!='direct' and not (on and iface): print('VPN-выход закрыт. Для прямого выхода AP: e-dev wifi vpn off')
 
 def wifi_clients():

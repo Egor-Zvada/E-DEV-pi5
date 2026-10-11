@@ -14,6 +14,19 @@ BASE = P.Path('/etc/e-dev')
 INTERFACES = ('eth0', 'wlan0', 'awg0')
 
 
+def logo(name):
+    for directory in (P.Path('/opt/e-dev/docs'), P.Path(__file__).resolve().parents[1]/'assets'):
+        try:
+            return (directory/name).read_text().splitlines()
+        except OSError:
+            continue
+    return []
+
+
+LOGO_SMALL = logo('logo-small.txt')
+LOGO_COMPACT = logo('logo-dashboard.txt')
+
+
 def text(path, fallback=''):
     try:
         return P.Path(path).read_text().strip()
@@ -56,6 +69,16 @@ def spark(values, width, ceiling=100):
     levels = '▁▂▃▄▅▆▇█'
     ceiling = max(ceiling, .001)
     return ''.join(levels[min(7, max(0, int(v/ceiling*7)))] for v in list(values)[-max(1, width):])
+
+
+def marquee(message, width, elapsed):
+    """Scroll a secondary status line; metric sampling stays independent."""
+    if width <= 0:
+        return ''
+    ribbon = message+' '*max(8, width//2)
+    position = int(max(0, elapsed)/.3) % len(ribbon)
+    repeated = ribbon*((position+width)//len(ribbon)+1)
+    return repeated[position:position+width]
 
 
 class Sampler:
@@ -135,9 +158,11 @@ class Sampler:
 
 
 class Canvas:
-    def __init__(self, window):
+    def __init__(self, window, origin_x=0):
         self.window = window
         self.height, self.width = window.getmaxyx()
+        self.origin_x = origin_x
+        self.width -= origin_x
 
     def put(self, y, x, value, style=0, limit=None):
         if y < 0 or y >= self.height or x < 0 or x >= self.width-1:
@@ -147,7 +172,7 @@ class Canvas:
         if limit is not None:
             space = min(space, limit)
         try:
-            self.window.addstr(y, x, value[:max(0, space)], style)
+            self.window.addstr(y, self.origin_x+x, value[:max(0, space)], style)
         except curses.error:
             pass
 
@@ -158,7 +183,7 @@ class Canvas:
         self.put(y, x, '━'*filled, style, limit=width)
 
 
-def render(window, data, page='main', colors=(0, 0, 0)):
+def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animated=True):
     canvas = Canvas(window)
     height, width = canvas.height, canvas.width
     accent, good, warn = colors
@@ -175,63 +200,85 @@ def render(window, data, page='main', colors=(0, 0, 0)):
         window.refresh()
         return
     if page == 'links':
-        hostname = data['system'].get('hostname', 'E-DEV')+'.local'
         canvas.put(3, 2, 'ПАНЕЛИ И ФАЙЛЫ', accent | curses.A_BOLD)
-        canvas.put(5, 2, 'LXConsole · пароль')
-        canvas.put(6, 4, 'https://'+hostname+':9443/')
-        canvas.put(8, 2, 'Incus UI · сертификат')
-        canvas.put(9, 4, 'https://'+hostname+':8443/ui/')
-        canvas.put(11, 2, 'Файлы · SMB')
-        canvas.put(12, 4, 'smb://'+hostname+'/Share')
-        canvas.put(14, 2, 'Через точку доступа: 10.42.0.1 · LAN: '+data.get('ips', {}).get('eth0', '—'))
+        addresses = [(name, addr) for name, addr in data.get('ips', {}).items()
+                     if name.startswith(('eth', 'en', 'wl')) and addr != '—']
+        visible = max(1, (height-6)//5)
+        for index, (name, addr) in enumerate(addresses[:visible]):
+            y = 4+index*5
+            canvas.put(y, 2, name+' · '+addr, accent | curses.A_BOLD)
+            canvas.put(y+1, 4, 'Пароль:      https://'+addr+':9443/')
+            canvas.put(y+2, 4, 'Сертификат:  https://'+addr+':8443/ui/')
+            canvas.put(y+3, 4, 'Файлы:       smb://'+addr+'/Share')
+        if not addresses:
+            canvas.put(5, 2, 'На LAN/AP сейчас нет IPv4-адресов.')
+        elif len(addresses) > visible:
+            canvas.put(height-2, 2, 'Все адреса: e-dev links')
     else:
-        half = width//2
-        left_width = half-5
-        right_width = width-half-3
-        canvas.put(3, 2, 'РЕСУРСЫ', accent | curses.A_BOLD)
-        canvas.put(3, half, 'РЕЖИМЫ', accent | curses.A_BOLD)
-        canvas.put(4, 2, f"CPU  {data['cpu']:5.1f}%", limit=left_width)
-        canvas.bar(5, 2, data['cpu'], left_width, accent)
-        canvas.put(6, 2, spark(data['cpu_history'], left_width), accent, left_width)
+        # Keep all three network plots at their usual rows, even at 80x24.
+        wide_logo = bool(LOGO_SMALL) and width >= 128 and height >= 24
+        compact_logo = bool(LOGO_COMPACT) and width >= 80 and not wide_logo
+        panel = Canvas(window, 44 if wide_logo else 0)
+        panel_width = panel.width
+        if wide_logo:
+            for index, line in enumerate(LOGO_SMALL):
+                canvas.put(3+index, 2, line, accent, 40)
+        elif compact_logo:
+            for index, line in enumerate(LOGO_COMPACT):
+                canvas.put(4+index, 2, line, accent, 12)
+        half = panel_width//2
+        resource_x = 17 if compact_logo else 2
+        resource_width = half-resource_x-3
+        right_width = panel_width-half-3
+        panel.put(3, resource_x, 'РЕСУРСЫ', accent | curses.A_BOLD)
+        panel.put(3, half, 'РЕЖИМЫ', accent | curses.A_BOLD)
+        panel.put(4, resource_x, f"CPU  {data['cpu']:5.1f}%", limit=resource_width)
+        panel.bar(5, resource_x, data['cpu'], resource_width, accent)
+        panel.put(6, resource_x, spark(data['cpu_history'], resource_width), accent, resource_width)
         mem = 100*data['mem_used']/max(1, data['mem_total'])
-        canvas.put(7, 2, 'RAM  '+human_bytes(data['mem_used'])+' / '+human_bytes(data['mem_total']), limit=left_width)
-        canvas.bar(8, 2, mem, left_width, accent)
-        canvas.put(9, 2, spark(data['ram_history'], left_width), accent, left_width)
-        canvas.put(10, 2, 'Диск '+human_bytes(data['disk_used'])+' / '+human_bytes(data['disk_total']), limit=left_width)
+        memory = ('RAM '+f"{data['mem_used']/2**30:.1f} / {data['mem_total']/2**30:.1f} GiB" if compact_logo
+                  else 'RAM  '+human_bytes(data['mem_used'])+' / '+human_bytes(data['mem_total']))
+        panel.put(7, resource_x, memory, limit=resource_width)
+        panel.bar(8, resource_x, mem, resource_width, accent)
+        panel.put(9, resource_x, spark(data['ram_history'], resource_width), accent, resource_width)
+        disk = (f"Диск {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f} GiB" if compact_logo
+                else 'Диск '+human_bytes(data['disk_used'])+' / '+human_bytes(data['disk_total']))
+        panel.put(10, resource_x, disk, limit=resource_width)
         uptime = int(data['uptime'])
-        canvas.put(11, 2, f"{data['temperature']:.1f} °C · uptime {uptime//86400}д {(uptime//3600)%24}ч {(uptime//60)%60}м", limit=left_width)
+        panel.put(11, resource_x, f"{data['temperature']:.1f} °C · {uptime//86400}д {(uptime//3600)%24}ч {(uptime//60)%60}м", limit=resource_width)
         mode = {'vpn': 'VPN', 'direct': 'DIRECT', 'hybrid': 'HYBRID'}.get(data['mode'], 'ЗАКРЫТ')
-        canvas.put(4, half, 'Wi-Fi AP   '+('ВКЛ' if data['ap'] else 'ВЫКЛ'), good if data['ap'] else warn, right_width)
-        canvas.put(5, half, 'Трафик AP  '+mode, accent | curses.A_BOLD, right_width)
+        panel.put(4, half, 'Wi-Fi AP   '+('ВКЛ' if data['ap'] else 'ВЫКЛ'), good if data['ap'] else warn, right_width)
+        panel.put(5, half, 'Трафик AP  '+mode, accent | curses.A_BOLD, right_width)
         available = data['enabled'] and data['tunnel']
         tunnel = 'ВКЛ · интерфейс поднят' if available else 'ВКЛ · нет интерфейса' if data['enabled'] else 'ВЫКЛ'
-        canvas.put(6, half, 'Туннель    '+tunnel, good if available else warn, right_width)
-        canvas.put(7, half, 'Сервер     '+data['selected'], limit=right_width)
+        panel.put(6, half, 'Туннель    '+tunnel, good if available else warn, right_width)
+        panel.put(7, half, 'Сервер     '+data['selected'], limit=right_width)
         policy = data['policy']
-        canvas.put(8, half, 'Выбор      '+policy.get('mode', 'manual').upper(), limit=right_width)
+        panel.put(8, half, 'Выбор      '+policy.get('mode', 'manual').upper(), limit=right_width)
         if policy.get('mode') == 'default':
-            canvas.put(9, half, str(policy.get('primary') or '—')+' → '+str(policy.get('backup') or 'без резерва'), limit=right_width)
+            panel.put(9, half, str(policy.get('primary') or '—')+' → '+str(policy.get('backup') or 'без резерва'), limit=right_width)
         else:
-            canvas.put(9, half, 'Контейнеры VPN: тот же сервер', limit=right_width)
+            panel.put(9, half, 'Контейнеры VPN: тот же сервер', limit=right_width)
         containers = '—' if data['containers'] is None else str(data['running'])+' / '+str(data['containers'])+' запущено'
-        canvas.put(10, half, 'Incus      '+containers, limit=right_width)
+        panel.put(10, half, 'Incus      '+containers, limit=right_width)
         clients = '—' if data['clients'] is None else str(data['clients'])
-        canvas.put(11, half, 'Wi-Fi      '+clients+' клиентов · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
+        panel.put(11, half, 'Wi-Fi      '+clients+' клиентов · '+data['system'].get('ssid', 'E-DEV'), limit=right_width)
         if height >= 24:
             row = 13
-            canvas.put(row, 2, 'СЕТЬ · RX ↓ / TX ↑', accent | curses.A_BOLD)
+            panel.put(row, 2, 'СЕТЬ · RX ↓ / TX ↑', accent | curses.A_BOLD)
             for index, name in enumerate(INTERFACES):
                 y = row+1+index*2
                 rx, tx = data['net'].get(name, (0, 0))
-                canvas.put(y, 2, f'{name:6}  ↓ {human_bytes(rx, "B/s"):>11}  ↑ {human_bytes(tx, "B/s"):>11}', limit=half-4)
+                panel.put(y, 2, f'{name:5} ↓ {human_bytes(rx, "B/s")} ↑ {human_bytes(tx, "B/s")}', limit=half-4)
                 hist = data['net_history'][name]
-                canvas.put(y, half, spark(hist, right_width, max(hist, default=1)), accent, right_width)
-                canvas.put(y+1, 2, data.get('ips', {}).get(name, '—'))
+                panel.put(y, half, spark(hist, right_width, max(hist, default=1)), accent, right_width)
+                panel.put(y+1, 2, data.get('ips', {}).get(name, '—'))
         services = data.get('services', {})
         summary = '  '.join(label+' '+('●' if services.get(name) == 'active' else '○') for name, label in [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
         canvas.put(height-3, 2, summary, good)
-        canvas.put(height-2, 2, 'Контейнеры default → провайдер · vpn → выбранный туннель', limit=width-5)
-    canvas.put(height-1, 2, 'q выход   l ссылки   r обновить   ·  2 с', accent)
+        ribbon = 'Egor Zvada · E-DEV · egor-zvada.ru    Контейнеры default → провайдер · vpn → выбранный туннель'
+        canvas.put(height-2, 2, marquee(ribbon, width-5, animation_time), accent, width-5)
+    canvas.put(height-1, 2, 'q выход   l ссылки   r обновить   p '+('пауза строки' if animated else 'двигать строку')+' · 2 с', accent)
     window.refresh()
 
 
@@ -252,19 +299,30 @@ def main(window):
     page = 'main'
     next_sample = 0
     data = None
+    animation_time = 0
+    previous_frame = time.monotonic()
+    animated = True
     while True:
-        if time.monotonic() >= next_sample:
+        now = time.monotonic()
+        if animated:
+            animation_time += now-previous_frame
+        previous_frame = now
+        if now >= next_sample:
             data = sampler.sample()
             next_sample = time.monotonic()+2
-        render(window, data, page, colors)
+        render(window, data, page, colors, animation_time, animated)
         key = window.getch()
         if key in (ord('q'), ord('Q'), 27):
             return
         if key in (ord('l'), ord('L')):
             page = 'links' if page == 'main' else 'main'
+            sampler.last_details = -float('inf')
+            next_sample = 0
         if key in (ord('r'), ord('R')):
             sampler.last_details = -float('inf')
             next_sample = 0
+        if key in (ord('p'), ord('P')):
+            animated = not animated
 
 
 if __name__ == '__main__':

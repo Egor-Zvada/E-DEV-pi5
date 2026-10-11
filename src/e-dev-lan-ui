@@ -291,7 +291,7 @@ def dhcp_menu(ui):
         backend['queue'](data)
         ui.run('Применение','--infobox','Применяю подсеть и DHCP…')
         for _ in range(150):
-            if not backend['REQUEST'].exists():
+            if not backend['applying']():
                 result = lan.output('systemctl','show','-p','Result','--value','e-dev-wifi-apply.service')
                 ui.message('OUT','Настройки применены. Текущие ссылки: e-dev links' if result=='success' else
                            'Изменение не завершилось. Прежние настройки восстановлены либо OUT закрыт.\nЖурнал: journalctl -u e-dev-wifi-apply')

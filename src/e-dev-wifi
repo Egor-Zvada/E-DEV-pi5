@@ -7,6 +7,7 @@ import json
 import os
 import pathlib as P
 import runpy
+import signal
 import subprocess as S
 import sys
 import time
@@ -210,8 +211,24 @@ def unblock_ap():
     call('nft', 'delete', 'table', 'inet', 'e_dev_wifi_change')
 
 
+def applying():
+    return REQUEST.exists() or call('systemctl','show','-p','ActiveState','--value','e-dev-wifi-apply.service') in ('active','activating','deactivating')
+
+
+def verify_ap(address):
+    runpy.run_path('/usr/local/sbin/e-dev-lan')['wait_output'](out_device(),address)
+
+
 def apply():
-    with lock('e-dev-wifi'), lock('e-dev-policy'), lock('e-dev-vpn'):
+    with lock('e-dev-wifi'):
+        try:
+            apply_locked()
+        finally:
+            REQUEST.unlink(missing_ok=True)
+
+
+def apply_locked():
+    with lock('e-dev-policy'), lock('e-dev-vpn'):
         data = validate(json.loads(REQUEST.read_text()), kernel_routes())
         if out_device()=='edevbr0':
             data['interface'] = 'edevbr0'
@@ -240,11 +257,12 @@ def apply():
                 info = json.loads(old_system) if old_system else {}
                 info['ssid'] = data['radio']['ssid']
                 save(system, info)
+            verify_ap(data['address'])
             runtime['routes'](mode)
             runtime['guard'](mode)
             call('systemctl', 'restart', 'e-dev-dns')
             unblock_ap()
-        except Exception:
+        except (Exception,KeyboardInterrupt):
             # A failed rollback keeps the temporary drop rule; it never opens a direct path.
             try:
                 modify(old)
@@ -262,6 +280,7 @@ def apply():
                 call('nmcli', '--wait', '30', 'connection', 'up', connection())
                 if old_radio is not None:
                     radio_activate()
+                verify_ap(old['address'])
                 runtime['routes'](mode)
                 runtime['guard'](mode)
                 call('systemctl', 'restart', 'e-dev-dns')
@@ -270,8 +289,6 @@ def apply():
             except Exception:
                 print('Ошибка отката. AP-трафик закрыт; восстановите настройки через Ethernet.', file=sys.stderr)
             raise
-        finally:
-            REQUEST.unlink(missing_ok=True)
         print('AP: '+data['address']+'; DHCP: '+(data['dhcp_range'] or 'auto')+'; режим: '+mode)
 
 
@@ -314,7 +331,10 @@ def execute(args):
 
 
 if __name__=='__main__':
+    def terminated(signum,frame): raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM,terminated)
     try: execute(sys.argv[1:] or ['show'])
     except (ValueError,OSError,S.SubprocessError) as error:
         print(str(error),file=sys.stderr);sys.exit(1)
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        print('Применение AP прервано; проверьте журнал e-dev-wifi-apply.',file=sys.stderr);sys.exit(1)

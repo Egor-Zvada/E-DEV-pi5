@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import os
 import tempfile
 import types
 import unittest
@@ -131,3 +132,35 @@ class SettingsTests(unittest.TestCase):
         self.assertIn('e-dev settings',index);self.assertIn('e-dev manuals',index)
         for old in ('wifi settings','lan setup','vpn on','help vpn','vpn add'):
             self.assertNotIn(old,index)
+
+    def test_logo_keeps_one_shared_margin_and_all_root_sections_fit(self):
+        for columns,rows,filename in [(80,24,'logo-settings-small.txt'),(80,32,'logo-settings.txt'),(120,40,'logo-small.txt')]:
+            size=os.terminal_size((columns,rows))
+            with patch.object(tui.shutil,'get_terminal_size',return_value=size), \
+                 patch.object(tui.S,'run',return_value=types.SimpleNamespace(returncode=0,stdout='ap\n')) as run:
+                dialog=tui.Dialog();prompt=dialog.logo()
+                original=(ROOT/'assets'/filename).read_text().splitlines()
+                # Preserve the original distances between frame, glyph and underline.
+                margin=len(prompt.splitlines()[0])-len(original[0])
+                self.assertEqual([line[margin:] for line in prompt.splitlines()],original)
+                dialog.menu('E-DEV 1.0 · Settings',prompt,[(str(i),str(i)) for i in range(6)])
+                args=run.call_args.args[0];menu=args.index('--menu')
+                self.assertGreaterEqual(int(args[menu+4]),6)
+                self.assertLessEqual(int(args[menu+2]),rows-2)
+                self.assertIn('--ascii-lines',args);self.assertIn('--no-nl-expand',args)
+
+    def test_returning_to_a_menu_preserves_the_selected_section(self):
+        with patch.object(tui.shutil,'get_terminal_size',return_value=os.terminal_size((80,24))), \
+             patch.object(tui.S,'run',return_value=types.SimpleNamespace(returncode=0,stdout='vpn\n')) as run:
+            dialog=tui.Dialog();items=[('ap','AP'),('vpn','VPN')]
+            dialog.menu('Settings','Choose',items);dialog.menu('Settings','Choose',items)
+            args=run.call_args.args[0]
+            self.assertEqual(args[args.index('--default-item')+1],'vpn')
+
+    def test_certificate_back_returns_to_incus_service_before_access_root(self):
+        menu=Menu(['certs',None])
+        with patch.object(ui,'output',return_value=json.dumps(dict(incus=True))), \
+             patch.object(ui,'certificates') as certificates:
+            ui.access_service(menu,'incus')
+        certificates.assert_called_once_with(menu)
+        self.assertEqual([screen[0] for screen in menu.screens],['Incus UI · сертификат']*2)

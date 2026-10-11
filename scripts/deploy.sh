@@ -12,6 +12,7 @@ for alias_name in E-DEV E-dev edev; do ln -sfn /usr/local/bin/e-dev "/usr/local/
 install -d -m 755 /opt/e-dev/docs/wiki /usr/local/share/man/man1 /etc/bash_completion.d
 install -m 644 "$REPO_DIR/assets/completion" /etc/bash_completion.d/e-dev
 install -m 644 "$REPO_DIR/assets/"logo*.txt /opt/e-dev/docs/
+install -m 644 "$REPO_DIR/assets/dialogrc" /opt/e-dev/docs/dialogrc
 rm -f /opt/e-dev/docs/wiki/wifi.txt /opt/e-dev/docs/wiki/passwd.txt
 install -m 644 "$REPO_DIR/docs/wiki/"*.txt /opt/e-dev/docs/wiki/
 install -m 644 "$REPO_DIR/docs/COMMANDS.md" /opt/e-dev/docs/E-DEV-guide.md

@@ -11,6 +11,7 @@ import pathlib as P
 import re
 import runpy
 import shutil
+import signal
 import subprocess as S
 import sys
 import time
@@ -437,6 +438,11 @@ def unblock_outputs():
     call('nft','delete','table','inet','e_dev_lan_change')
 
 
+def port_forwarding(device):
+    state=P.Path('/sys/class/net')/device/'brport/state'
+    return state.exists() and state.read_text().strip()=='3'
+
+
 def verify_output(device, address):
     if address not in read_addresses().get(device,[]):
         raise ValueError('OUT не получил ожидаемый адрес: '+device)
@@ -446,6 +452,8 @@ def verify_output(device, address):
         master = next((row.get('master') for row in links if row['ifname']=='wlan0'),None)
         if master not in (BRIDGE,bridge) or bridge is None:
             raise ValueError('Встроенная точка wlan0 не включена в мост OUT.')
+        if not port_forwarding('wlan0'):
+            raise ValueError('Точка wlan0 ещё не передаёт трафик через мост OUT.')
 
 
 def verify_active(active, devices):
@@ -488,7 +496,21 @@ def input_snapshot(plan):
 
 
 def apply():
-    with lock('e-dev-wifi'), lock('e-dev-policy'), lock('e-dev-vpn'):
+    with lock('e-dev-wifi'):
+        started=time.time()
+        try:
+            apply_locked()
+        except (Exception,KeyboardInterrupt) as error:
+            # Failures before changing the network must also reach the waiting UI.
+            if read(RESULT,{}).get('updated',0)<started:
+                save(RESULT,dict(success=False,recovered=True,error=str(error)[:500] or 'Операция прервана.',updated=time.time()))
+            raise
+        finally:
+            REQUEST.unlink(missing_ok=True)
+
+
+def apply_locked():
+    with lock('e-dev-policy'), lock('e-dev-vpn'):
         plan = validate(read(REQUEST))
         devices = inventory()
         old = read(B/'lan.json')
@@ -528,7 +550,7 @@ def apply():
             call('systemctl','try-restart','smbd')
             unblock_outputs()
             save(RESULT,dict(success=True,updated=time.time(),backup=str(backup)))
-        except Exception as error:
+        except (Exception,KeyboardInterrupt) as error:
             recovered = False
             try:
                 for name in output('nmcli','-t','-f','NAME','connection','show').splitlines():
@@ -568,8 +590,6 @@ def apply():
                 save(RESULT,dict(success=False,recovered=recovered,error=str(error)[:500],
                                  updated=time.time(),backup=str(backup)))
             raise
-        finally:
-            REQUEST.unlink(missing_ok=True)
 
 
 def queue(plan):
@@ -626,8 +646,13 @@ def main():
 
 
 if __name__=='__main__':
+    def terminated(signum,frame): raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM,terminated)
     try:
         main()
     except (ValueError,OSError,KeyError,StopIteration,S.SubprocessError) as error:
         print(str(error),file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('Сетевая операция прервана; проверьте журнал e-dev-lan-apply.',file=sys.stderr)
         sys.exit(1)

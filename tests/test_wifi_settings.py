@@ -18,6 +18,27 @@ class WifiSettingsTests(unittest.TestCase):
     def candidate(self):
         return dict(address='192.168.50.1/24', dhcp_range='192.168.50.100,192.168.50.200', lease=3600)
 
+    def test_early_validation_failure_cleans_request_without_changing_ap(self):
+        with self.applying() as (base,request,old_dns,events),patch.object(w,'validate',side_effect=ValueError('invalid')):
+            with self.assertRaises(ValueError):w.apply()
+            self.assertFalse(request.exists());self.assertEqual(events,[])
+
+    def test_ui_waits_until_systemd_finishes_after_request_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(w,'REQUEST',pathlib.Path(tmp)/'request'), \
+             patch.object(w,'call',return_value='activating') as call:
+            self.assertTrue(w.applying())
+            call.return_value='failed';self.assertFalse(w.applying())
+
+    def test_interruption_rolls_back_before_unblocking(self):
+        with self.applying() as (base,request,old_dns,events), \
+             patch.object(w,'radio_snapshot',return_value={}), \
+             patch.object(w,'radio_modify',side_effect=KeyboardInterrupt), \
+             patch.object(w,'radio_restore') as restore,patch.object(w,'radio_activate'):
+            request.write_text(json.dumps(dict(self.candidate(),radio=dict(ssid='new',band='bg',channel=11))))
+            with self.assertRaises(KeyboardInterrupt):w.apply()
+            restore.assert_called_once();self.assertFalse(request.exists())
+            self.assertLess(events.index(('verify','10.42.0.1/24')),events.index(('unblock',)))
+
     def test_radio_validation_and_secret_file_permissions(self):
         data=dict(ssid='My AP',band='bg',channel=11,psk='test-passphrase')
         candidate=dict(self.candidate(),radio=data)
@@ -112,6 +133,7 @@ class WifiSettingsTests(unittest.TestCase):
                  patch.object(w,'call',side_effect=call), patch.object(w.runpy,'run_path',return_value=runtime), \
                  patch.object(w,'block_ap',side_effect=lambda:events.append(('block',))), \
                  patch.object(w,'unblock_ap',side_effect=lambda:events.append(('unblock',))), \
+                 patch.object(w,'verify_ap',side_effect=lambda address:events.append(('verify',address))), \
                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 yield base, request, old_dns, events
 

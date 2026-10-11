@@ -157,11 +157,18 @@ class LanTests(unittest.TestCase):
 
     def test_out_readiness_rejects_detached_ap_even_with_bridge_ip(self):
         links=[dict(ifname='edevbr0',ifindex=8),dict(ifname='wlan0',ifindex=3)]
-        with patch.object(l,'read_addresses',return_value={'edevbr0':['10.42.0.1/24']}),patch.object(l,'output',return_value=json.dumps(links)):
+        with patch.object(l,'read_addresses',return_value={'edevbr0':['10.42.0.1/24']}),patch.object(l,'output',return_value=json.dumps(links)),patch.object(l,'port_forwarding',return_value=True):
             with self.assertRaises(ValueError): l.verify_output('edevbr0','10.42.0.1/24')
             links[1]['master']=8
             with patch.object(l,'output',return_value=json.dumps(links)):
                 l.verify_output('edevbr0','10.42.0.1/24')
+
+    def test_attached_ap_is_not_ready_until_bridge_port_forwards_packets(self):
+        links=[dict(ifname='edevbr0',ifindex=8),dict(ifname='wlan0',master=8)]
+        with patch.object(l,'read_addresses',return_value={'edevbr0':['10.42.0.1/24']}), \
+             patch.object(l,'output',return_value=json.dumps(links)),patch.object(l,'port_forwarding',return_value=False) as forwarding:
+            with self.assertRaises(ValueError):l.verify_output('edevbr0','10.42.0.1/24')
+            forwarding.return_value=True;l.verify_output('edevbr0','10.42.0.1/24')
 
     def test_restore_requires_original_active_connection_not_only_successful_command(self):
         with patch.object(l,'output',return_value='other-uuid'):
@@ -210,6 +217,23 @@ class LanTests(unittest.TestCase):
             result=json.loads((root/'result').read_text())
             self.assertFalse(result['success']);self.assertTrue(result['recovered'])
             self.assertEqual(pathlib.Path(result['backup']).stat().st_mode&0o777,0o700)
+
+    def test_early_validation_failure_reports_unchanged_network_and_cleans_request(self):
+        with self.transaction() as (root,base,keys,request,events,original), \
+             patch.object(l,'validate',side_effect=ValueError('invalid plan')):
+            with self.assertRaises(ValueError):l.apply()
+            self.assertEqual(events,[]);self.assertFalse(request.exists())
+            result=json.loads((root/'result').read_text())
+            self.assertFalse(result['success']);self.assertTrue(result['recovered'])
+            self.assertIn('invalid plan',result['error'])
+
+    def test_interrupted_lan_change_rolls_back_and_is_not_reported_as_success(self):
+        with self.transaction() as (root,base,keys,request,events,original), \
+             patch.object(l,'configure_out',side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):l.apply()
+            self.assertEqual(events,['block','unblock']);self.assertFalse(request.exists())
+            result=json.loads((root/'result').read_text())
+            self.assertFalse(result['success']);self.assertTrue(result['recovered'])
 
     def test_failed_restore_does_not_unblock_outputs(self):
         with self.transaction(rollback_ok=False) as (root,base,keys,request,events,original):

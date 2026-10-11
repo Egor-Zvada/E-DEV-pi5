@@ -83,9 +83,10 @@ def action(ui,title,*args,payload=None):
 
 
 def wait_ap(ui):
+    wifi=load('e-dev-wifi')
     ui.run('Применение AP','--infobox','Служба применяет настройки точки…')
     for _ in range(180):
-        if not P.Path('/run/e-dev-wifi-request.json').exists():
+        if not wifi.applying():
             result=output('systemctl','show','-p','Result','--value','e-dev-wifi-apply.service')
             if result!='success': raise ValueError('Настройки AP не применены. Служба выполнила откат либо закрыла OUT.\nЖурнал: journalctl -u e-dev-wifi-apply')
             ui.message('AP','Настройки применены.\nТекущие адреса: e-dev links')
@@ -324,12 +325,30 @@ def certificates(ui):
                 action(ui,'Сертификат Incus','cert-remove',choice)
 
 
+ACCESS_LABELS={'ssh':'SSH','ui':'LXConsole','files':'Файлы SMB','incus':'Incus UI · сертификат'}
+
+
+def access_service(ui,service):
+    while True:
+        enabled=json.loads(output(ACTIONS,'access-state'))[service]
+        selected=ui.menu(ACCESS_LABELS[service],'Доступ '+('включён' if enabled else 'выключен'),
+                         [('toggle','Выключить доступ' if enabled else 'Включить доступ')]+
+                         ([('certs','Доверенные сертификаты')] if service=='incus' else [('password','Сменить пароль')]))
+        if selected is None:return
+        if selected=='password':password(ui,service)
+        elif selected=='certs':certificates(ui)
+        elif selected=='toggle':
+            if service=='ssh' and enabled and not ui.yes('Выключить SSH?',
+                'Новые SSH-подключения будут недоступны.\nДля включения используйте монитор и клавиатуру на Pi.'):
+                continue
+            action(ui,'Доступ','access',service,'off' if enabled else 'on')
+
+
 def access_menu(ui):
-    labels={'ssh':'SSH','ui':'LXConsole','files':'Файлы SMB','incus':'Incus UI · сертификат'}
     while True:
         state=json.loads(output(ACTIONS,'access-state'))
         choice=ui.menu('Доступ и пароли','Пароль Wi-Fi находится в AP → Wi-Fi.\nIncus UI использует сертификаты.',
-                       [(n,label+' · '+('ВКЛ' if state[n] else 'ВЫКЛ')) for n,label in labels.items()]+
+                       [(n,label+' · '+('ВКЛ' if state[n] else 'ВЫКЛ')) for n,label in ACCESS_LABELS.items()]+
                        [('password-all','Общий новый пароль · SSH, UI, SMB, AP'),
                         ('all-on','Включить доступ ко всем сервисам'),('all-off','Выключить доступ ко всем сервисам')])
         if choice is None: return
@@ -339,17 +358,7 @@ def access_menu(ui):
             if not ui.yes('Изменить весь доступ?', 'Включить все сервисы?' if enable else 'Выключить SSH, обе панели и SMB?\nПовторный вход по SSH станет недоступен. Включить можно с локальной консоли.\nКонтейнеры и AP продолжат работать.'):
                 continue
             action(ui,'Доступ','access','all','on' if enable else 'off')
-        else:
-            selected=ui.menu(labels[choice],'Доступ '+('включён' if state[choice] else 'выключен'),
-                             [('toggle','Выключить доступ' if state[choice] else 'Включить доступ')]+
-                             ([('certs','Доверенные сертификаты')] if choice=='incus' else [('password','Сменить пароль')]))
-            if selected=='password': password(ui,choice)
-            elif selected=='certs': certificates(ui)
-            elif selected=='toggle':
-                if choice=='ssh' and state[choice] and not ui.yes('Выключить SSH?',
-                    'Новые SSH-подключения будут недоступны.\nДля включения используйте монитор и клавиатуру на Pi.'):
-                    continue
-                action(ui,'Доступ','access',choice,'off' if state[choice] else 'on')
+        else:access_service(ui,choice)
 
 
 def manuals(ui):

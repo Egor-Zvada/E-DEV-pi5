@@ -224,7 +224,7 @@ def apply_password(service,p):
             backend['queue'](data)
             print('Пароль AP передан службе; клиенты переподключатся.',flush=True)
             for _ in range(180):
-                if not backend['REQUEST'].exists():
+                if not backend['applying']():
                     if out(['systemctl','show','-p','Result','--value','e-dev-wifi-apply.service'])!='success':
                         fail('Пароль AP не применён. Остальные выполненные изменения сохраняются; журнал e-dev-wifi-apply.')
                     print('Пароль обновлён: wifi')

@@ -1,5 +1,13 @@
 _e_dev_complete() {
- local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1],,}" sub="${COMP_WORDS[2],,}" words=""
+ # Reload the installed implementation: open shells follow later code updates.
+ local completion_source="${BASH_SOURCE[0]}"
+ [[ ! -r "$completion_source" ]] || source "$completion_source"
+ _e_dev_complete_impl "$@"
+}
+_e_dev_complete_impl() {
+ local cur="${COMP_WORDS[COMP_CWORD]}" cmd sub item words=""
+ cmd=$(printf %s "${COMP_WORDS[1]:-}" | tr '[:upper:]' '[:lower:]')
+ sub=$(printf %s "${COMP_WORDS[2]:-}" | tr '[:upper:]' '[:lower:]')
  COMPREPLY=()
  case "$COMP_CWORD" in
   1) words="help settings manuals status links wifi vpn lan speedtest passwd" ;;
@@ -10,11 +18,10 @@ _e_dev_complete() {
       passwd) words="all" ;;
      esac ;;
   4) if [[ "$cmd:$sub" == vpn:add ]]; then
-      mapfile -t COMPREPLY < <(compgen -f -- "$cur")
-      compopt -o filenames
+      while IFS= read -r item; do COMPREPLY+=("$item"); done < <(compgen -f -- "$cur")
       return
      fi ;;
  esac
- mapfile -t COMPREPLY < <(compgen -W "$words" -- "$cur")
+ while IFS= read -r item; do COMPREPLY+=("$item"); done < <(compgen -W "$words" -- "$cur")
 }
-complete -F _e_dev_complete e-dev E-DEV E-dev edev
+complete -o filenames -F _e_dev_complete e-dev E-DEV E-dev edev

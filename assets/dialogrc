@@ -1,0 +1,7 @@
+# Keep both sides of the frame readable with terminal color palettes.
+border_color = (BLACK,WHITE,OFF)
+border2_color = (BLACK,WHITE,OFF)
+menubox_border_color = (BLACK,WHITE,OFF)
+menubox_border2_color = (BLACK,WHITE,OFF)
+inputbox_border_color = (BLACK,WHITE,OFF)
+inputbox_border2_color = (BLACK,WHITE,OFF)

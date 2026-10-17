@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """VPN selection, isolated probes and measured daily ranking. No secret logs."""
-import pathlib as P, subprocess as S, json, sys, time, fcntl, re, hashlib, contextlib, datetime, os, signal
+import pathlib as P, subprocess as S, json, sys, time, fcntl, re, hashlib, contextlib, datetime, os, signal, pwd
 B=P.Path('/etc/e-dev');R='/usr/local/sbin/e-dev-vpn'
 def run(*args,check=False,input=None,timeout=None):
  env=dict(os.environ,WG_QUICK_USERSPACE_IMPLEMENTATION='/usr/local/sbin/e-dev-awg-launch') if args[0]=='awg-quick' else None
+ if args[0]=='/usr/local/bin/speedtest':
+  # Root system services may have no HOME. Ookla aborts before testing without it.
+  env=dict(os.environ)
+  if not env.get('HOME'): env['HOME']=pwd.getpwuid(os.geteuid()).pw_dir
  return S.run(args,text=True,input=input,stdout=S.PIPE,stderr=S.PIPE,check=check,timeout=timeout,env=env)
 def read(name,default):
  p=B/name

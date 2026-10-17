@@ -2,6 +2,19 @@ import importlib.util, importlib.machinery, unittest, tempfile, pathlib, context
 from unittest.mock import patch
 loader=importlib.machinery.SourceFileLoader('policy',str(pathlib.Path(__file__).resolve().parents[1]/'src/e-dev-policy'))
 p=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(p)
+class SpeedtestEnvironmentTests(unittest.TestCase):
+ def test_background_speedtest_gets_home_when_missing_or_empty(self):
+  for environment in ({'PATH':'/usr/bin'}, {'PATH':'/usr/bin','HOME':''}):
+   with self.subTest(environment=environment),patch.dict(p.os.environ,environment,clear=True), \
+        patch.object(p.pwd,'getpwuid',return_value=type('User',(),{'pw_dir':'/root'})()),patch.object(p.S,'run') as run:
+    p.run('/usr/local/bin/speedtest','--interface=awg0',timeout=150)
+    self.assertEqual(run.call_args.kwargs['env'],{'PATH':'/usr/bin','HOME':'/root'})
+    self.assertEqual(run.call_args.kwargs['timeout'],150)
+ def test_explicit_home_is_preserved(self):
+  with patch.dict(p.os.environ,{'HOME':'/var/lib/test-speedtest'},clear=True),patch.object(p.S,'run') as run:
+   p.run('/usr/local/bin/speedtest','--version')
+   self.assertEqual(run.call_args.kwargs['env']['HOME'],'/var/lib/test-speedtest')
+
 class PolicyTests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)

@@ -565,7 +565,7 @@ def main(args):
     print('Регистратор: '+output.strip()+'; интервал 10 с, сетевые проверки 60 с.')
     print('Данные: '+str(LOG)+'; лимит 128 MiB, до 12 снимков за 7 дней.')
     if status:
-        print('Последний отсчёт: '+str(round(time.time()-status['time']))+' с назад; журнал событий: '+('подключён' if status['journal_connected'] else 'переподключается'))
+        print('Последний отсчёт: '+str(round(time.time()-status['time']))+' с назад; журнал событий: '+('подключён' if status['journal_connected'] else 'переподключается')+'; Wi-Fi события: '+('подключены' if status.get('wireless_connected') else 'переподключаются'))
         print('Проверки: '+clean(json.dumps(status['sample'].get('probes', {}), ensure_ascii=False)))
         if status['sample'].get('memory_controller') is False:
             print('ВНИМАНИЕ: memory cgroup выключен, лимиты памяти не применяются. Проверьте параметры загрузки.')

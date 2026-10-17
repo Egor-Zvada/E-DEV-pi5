@@ -17,3 +17,4 @@ profiles/
 *.db
 !config/*.conf
 !config/journald/*.conf
+!config/incus/*.conf

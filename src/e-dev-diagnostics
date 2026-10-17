@@ -217,7 +217,7 @@ def journal_event(row):
     if match:
         return dict(time=stamp, kind='interface-state', interface=clean(match[1], 32), previous=match[2], state=match[3])
     unit = row.get('_SYSTEMD_UNIT', '')
-    if unit in ('e-dev-dns.service', 'e-dev-auto.service', 'e-dev-vpn-health.service',
+    if unit in ('incus.service', 'incus-startup.service', 'e-dev-dns.service', 'e-dev-auto.service', 'e-dev-vpn-health.service',
                 'e-dev-uplink.service', 'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
         return dict(time=stamp, kind='service-event', unit=unit, message=clean(message))
     if re.search(r'brcmf|cfg80211|wlan0|under.?voltage|out of memory|oom-kill', message, re.I) and re.search(r'error|fail|timeout|timed out|crash|hang|under.?voltage|out of memory|oom-kill', message, re.I):
@@ -401,7 +401,7 @@ class Store:
 
 def journal_process():
     filters = []
-    for unit in ('NetworkManager.service', 'wpa_supplicant.service', 'e-dev-dns.service',
+    for unit in ('NetworkManager.service', 'wpa_supplicant.service', 'incus.service', 'incus-startup.service', 'e-dev-dns.service',
                  'e-dev-auto.service', 'e-dev-vpn-health.service', 'e-dev-uplink.service',
                  'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
         filters.extend((['_SYSTEMD_UNIT='+unit] if not filters else ['+', '_SYSTEMD_UNIT='+unit]))

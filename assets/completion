@@ -10,12 +10,13 @@ _e_dev_complete_impl() {
  sub=$(printf %s "${COMP_WORDS[2]:-}" | tr '[:upper:]' '[:lower:]')
  COMPREPLY=()
  case "$COMP_CWORD" in
-  1) words="help settings manuals status links wifi vpn lan speedtest passwd" ;;
+  1) words="help settings manuals status links wifi vpn lan speedtest passwd diagnostics" ;;
   2) case "$cmd" in
       status) words="--once" ;;
       wifi) words="clients status" ;;
       vpn|lan) words="status" ;;
       passwd) words="all" ;;
+      diagnostics) words="status last events snapshot" ;;
      esac ;;
   4) if [[ "$cmd:$sub" == vpn:add ]]; then
       while IFS= read -r item; do COMPREPLY+=("$item"); done < <(compgen -f -- "$cur")

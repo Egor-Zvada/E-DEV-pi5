@@ -81,7 +81,7 @@ class DashboardTests(unittest.TestCase):
                     self.assertIn('Swp', window.row(9))
                     self.assertIn('CPU', window.row(10))
                     self.assertIn('RAM', window.row(11))
-                    self.assertIn('43°C', window.row(height-3))
+                    self.assertIn('43.0°C', window.row(2))
                     self.assertIn('0.00 Mb/s', window.row(13))
                     self.assertIn('шкала', window.row(12))
                     if width >= 128:
@@ -107,6 +107,44 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(d.marquee('abc', 0, 1), '')
         self.assertEqual(d.marquee('abc', 100, 0)[:11], 'abc        ')
         self.assertEqual(len(d.marquee('abc', 100, 100)), 100)
+
+    def test_temperature_and_hardware_state_remain_visible_in_short_windows(self):
+        data=sample_data();data['temperature']=81.2;data['throttled']=5
+        for height,width in ((18,60),(24,80),(40,140)):
+            window=Window(height,width);d.render(window,data)
+            self.assertIn('81.2°C',window.row(2))
+            self.assertIn('ПРОСАДКА',window.row(1))
+            self.assertIn('ОГРАНИЧЕНИЕ',window.row(1))
+        self.assertEqual(d.hardware_labels(0),('питание OK','ограничений нет'))
+        self.assertIn('ранее',d.hardware_labels(0x40000)[1])
+        self.assertEqual(d.hardware_labels(None),('питание ?','ограничения ?'))
+
+    def test_key_autorepeat_does_not_bypass_sampling_or_busy_loop(self):
+        clock=[100.0]
+        def sleep(seconds):clock[0]+=seconds
+        keys=iter([ord('r')]*60+[ord('q')]);timeout=[200]
+        window=SimpleNamespace(timeout=lambda ms:timeout.__setitem__(0,ms),getch=lambda:next(keys) if timeout[0] else -1)
+        with patch.object(d.curses,'curs_set'),patch.object(d.curses,'has_colors',return_value=False), \
+             patch.object(d,'Sampler') as sampler,patch.object(d,'render',return_value=(0,0)), \
+             patch.object(d.time,'monotonic',side_effect=lambda:clock[0]),patch.object(d.time,'sleep',side_effect=sleep):
+            sampler.return_value.sample.return_value=sample_data()
+            d.main(window)
+        self.assertGreaterEqual(clock[0]-100,11)
+        self.assertLessEqual(sampler.return_value.sample.call_count,7)
+
+    def test_queued_refresh_keys_do_not_delay_exit(self):
+        keys=iter([ord('r')]*60+[ord('q'),-1])
+        window=SimpleNamespace(timeout=lambda ms:None,getch=lambda:next(keys))
+        with patch.object(d.curses,'curs_set'),patch.object(d.curses,'has_colors',return_value=False), \
+             patch.object(d,'Sampler') as sampler,patch.object(d,'render',return_value=(0,0)), \
+             patch.object(d.time,'sleep') as sleep:
+            sampler.return_value.sample.return_value=sample_data();d.main(window)
+        self.assertEqual(sampler.return_value.sample.call_count,1)
+        sleep.assert_not_called()
+
+    def test_temperature_graph_has_a_readable_range_for_small_changes(self):
+        self.assertEqual(d.thermal_scale([71,72,73]),(65,75))
+        self.assertEqual(d.thermal_scale([80]),(75,85))
 
 
     def test_cpu_segments_leave_iowait_empty(self):

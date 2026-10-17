@@ -310,7 +310,7 @@ def vpn_menu(ui):
 def certificates(ui):
     while True:
         rows=json.loads(output('incus','config','trust','list','--format=json'))
-        visible=[c for c in rows if c.get('name')!='lxconsole']
+        visible=[c for c in rows if c.get('name') not in ('lxconsole','E-DEV LXConsole')]
         choice=ui.menu('Incus · сертификаты','Публичный .crt добавляется на Pi; приватный .pfx остаётся в браузере.\nСлужебный сертификат LXConsole защищён от удаления.',
                        [('add','Добавить публичный .crt')]+[(c['fingerprint'],str(c.get('name') or 'Без имени')+' · '+c['fingerprint'][:12]) for c in visible])
         if choice is None: return

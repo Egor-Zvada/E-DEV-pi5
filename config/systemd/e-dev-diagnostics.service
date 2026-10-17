@@ -1,0 +1,29 @@
+[Unit]
+Description=E-DEV bounded network and hardware flight recorder
+After=NetworkManager.service e-dev-guard.service
+ConditionPathExists=/etc/e-dev/mode
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/e-dev-diagnostics daemon
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=10
+UMask=0077
+LogsDirectory=e-dev-diagnostics
+LogsDirectoryMode=0700
+RuntimeDirectory=e-dev-diagnostics
+RuntimeDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/e-dev-diagnostics /run/e-dev-diagnostics
+PrivateTmp=true
+NoNewPrivileges=true
+Nice=10
+CPUWeight=10
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

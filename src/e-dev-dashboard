@@ -7,6 +7,7 @@ import json
 import math
 import os
 import pathlib as P
+import re
 import subprocess as S
 import sys
 import time
@@ -47,6 +48,20 @@ def command(args):
         return S.run(args, text=True, capture_output=True, stdin=S.DEVNULL, timeout=3).stdout.strip()
     except (OSError, S.TimeoutExpired):
         return ''
+
+
+def hardware_labels(flags):
+    if flags is None:
+        return 'питание ?', 'ограничения ?'
+    power = 'ПРОСАДКА' if flags & 1 else 'OK' if not flags & 0x10000 else 'была просадка'
+    limits = 'ОГРАНИЧЕНИЕ' if flags & 14 else 'ранее ограничивался' if flags & 0xe0000 else 'ограничений нет'
+    return 'питание '+power, limits
+
+
+def thermal_scale(values):
+    low = 5*math.floor((min(values)-2)/5)
+    high = max(low+10, 5*math.ceil((max(values)+2)/5))
+    return low, high
 
 
 def cpu_percent(before, after):
@@ -153,6 +168,7 @@ class Sampler:
         self.previous_time = time.monotonic()
         self.cpu_history = collections.deque(maxlen=90)
         self.ram_history = collections.deque(maxlen=90)
+        self.temperature_history = collections.deque(maxlen=90)
         self.net_history = {name: collections.deque(maxlen=90) for name in INTERFACES}
         self.rx_history = {}
         self.tx_history = {}
@@ -223,11 +239,13 @@ class Sampler:
         self.previous_time = now
         self.cpu_history.append(cpu)
         self.ram_history.append(100*used/total)
+        temperature = float(text('/sys/class/thermal/thermal_zone0/temp', '0'))/1000
+        self.temperature_history.append(temperature)
         return dict(self.details, cpu=cpu, cpu_parts=parts, cores=cores,
                     mem_used=used, mem_total=total, mem_cache=cache,
                     swap_used=swap_used, swap_total=swap_total,
                     disk_used=disk_total-disk_free, disk_total=disk_total,
-                    temperature=float(text('/sys/class/thermal/thermal_zone0/temp', '0'))/1000,
+                    temperature=temperature, temperature_history=self.temperature_history,
                     uptime=float(text('/proc/uptime', '0').split()[0]), net=net,
                     cpu_history=self.cpu_history, ram_history=self.ram_history,
                     net_history=self.net_history,
@@ -255,10 +273,13 @@ class Sampler:
         except (OSError, S.TimeoutExpired):
             clients = None
         try:
-            containers = json.loads(command(['incus', 'list', '--format=json']))
-            running = sum(row['status'] == 'Running' for row in containers)
-            count = len(containers)
-        except (ValueError, TypeError, KeyError):
+            result = S.run(['incus','list','--format=csv','--columns=s'], text=True,
+                           capture_output=True, stdin=S.DEVNULL, timeout=3)
+            if result.returncode:
+                raise ValueError('Incus unavailable')
+            states = result.stdout.splitlines()
+            running, count = sum(state.upper()=='RUNNING' for state in states), len(states)
+        except (ValueError, OSError, S.TimeoutExpired):
             running = count = None
         try:
             addresses = json.loads(command(['ip', '-j', '-4', 'addr']))
@@ -280,6 +301,8 @@ class Sampler:
             pass
         self.details = dict(services=services, ap=ap, clients=clients,
                             running=running, containers=count, ips=ips, devices=devices)
+        flags = re.search(r'0x[0-9a-f]+', command(['vcgencmd', 'get_throttled']), re.I)
+        self.details['throttled'] = int(flags[0], 16) if flags else None
 
 
 class Canvas:
@@ -409,8 +432,12 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
     canvas.put(0, 10, 'Egor Zvada · egor-zvada.ru')
     if width >= 85:
         canvas.put(0, width-22, datetime.datetime.now().strftime('%d.%m  %H:%M:%S'))
-    canvas.put(1, 2, '─'*(width-5), accent)
+    power, limits = hardware_labels(data.get('throttled'))
+    temperature = data.get('temperature')
+    thermal_style = (colors[3] if len(colors)>3 else warn) if temperature is not None and temperature>=80 else warn if temperature is not None and temperature>=75 else good
+    canvas.put(1, 2, power+' · '+limits, thermal_style | curses.A_BOLD)
     if width < 60 or height < 18:
+        canvas.put(2, 2, 'Темп CPU '+f'{temperature:.1f}°C' if temperature is not None else 'Темп CPU —', thermal_style)
         canvas.put(3, 2, 'Для дашборда увеличьте терминал до 60×18.')
         canvas.put(5, 2, 'Wi-Fi: '+data['mode'].upper()+' · VPN: '+data['selected'])
         canvas.put(height-1, 2, 'q  выход')
@@ -446,7 +473,18 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         mode_x = resource_x+(panel.width-resource_x-3)*55//100
         resource_width = mode_x-resource_x-2
         right_width = panel.width-mode_x-3
-        panel.put(2, resource_x, 'РЕСУРСЫ', accent | curses.A_BOLD)
+        history = list(data.get('temperature_history', [temperature]))
+        if temperature is not None and history:
+            low, high = thermal_scale(history)
+            prefix = f'ТЕМП {temperature:.1f}°C '
+            scale = f' {low:.0f}–{high:.0f}'
+            plot_width = max(0, resource_width-len(prefix)-len(scale))
+            panel.put(2, resource_x, prefix, thermal_style | curses.A_BOLD, resource_width)
+            if plot_width:
+                panel.put(2, resource_x+len(prefix), spark([v-low for v in history],plot_width,high-low), thermal_style,plot_width)
+                panel.put(2, resource_x+len(prefix)+plot_width, scale,curses.A_DIM,len(scale))
+        else:
+            panel.put(2, resource_x, 'ТЕМП —', accent | curses.A_BOLD)
         panel.put(2, mode_x, 'РЕЖИМЫ', accent | curses.A_BOLD)
         cpu_colors = (good, colors[4] if len(colors)>4 else accent,
                       colors[3] if len(colors)>3 else warn, warn)
@@ -509,7 +547,7 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
         summary = '  '.join(label+' '+('●' if services.get(name)=='active' else '○') for name, label in
                             [('incus', 'Incus'), ('lxconsole', 'UI'), ('smbd', 'SMB'), ('e-dev-dns', 'DNS')])
         if full:
-            summary += f"   SD {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f}G · {data['temperature']:.0f}°C"
+            summary += f"   SD {data['disk_used']/2**30:.1f}/{data['disk_total']/2**30:.0f}G"
         if maximum:
             summary += f'   сеть {network_scroll+1}/{maximum+1} · ↑↓/Pg'
         canvas.put(height-3, 2, summary, good)
@@ -518,6 +556,21 @@ def render(window, data, page='main', colors=(0, 0, 0), animation_time=0, animat
     canvas.put(height-1, 2, 'q выход   l ссылки   r обновить   p '+('пауза строки' if animated else 'двигать строку')+' · 2 с', accent)
     window.refresh()
     return network_scroll, maximum if page=='main' else 0
+
+
+def read_keys(window):
+    first = window.getch()
+    keys = [] if first == -1 else [first]
+    window.timeout(0)
+    try:
+        for _ in range(127):
+            key = window.getch()
+            if key == -1:
+                break
+            keys.append(key)
+    finally:
+        window.timeout(200)
+    return keys
 
 
 def main(window):
@@ -552,19 +605,16 @@ def main(window):
             next_sample = time.monotonic()+2
         position = render(window, data, page, colors, animation_time, animated, network_scroll)
         network_scroll, maximum = position or (0, 0)
-        key = window.getch()
-        if key in (ord('q'), ord('Q'), 27):
+        keys = read_keys(window)
+        if any(key in (ord('q'), ord('Q'), 27) for key in keys):
             return
-        if key in (ord('l'), ord('L')):
+        if sum(key in (ord('l'), ord('L')) for key in keys) % 2:
             page = 'links' if page == 'main' else 'main'
-            sampler.last_details = -float('inf')
-            next_sample = 0
-        if key in (ord('r'), ord('R')):
-            sampler.last_details = -float('inf')
-            next_sample = 0
-        if key in (ord('p'), ord('P')):
+        # Repeated R presses do not bypass the 2 s sample cadence or the 10 s
+        # service/Incus cache. Otherwise keyboard autorepeat creates its own load.
+        if sum(key in (ord('p'), ord('P')) for key in keys) % 2:
             animated = not animated
-        if page=='main':
+        for key in keys if page=='main' else []:
             if key==curses.KEY_UP:
                 network_scroll = max(0, network_scroll-1)
             if key==curses.KEY_DOWN:
@@ -576,6 +626,11 @@ def main(window):
                 network_scroll = 0
             if key==curses.KEY_END:
                 network_scroll = maximum
+        # getch returns immediately while keys are queued; cap drawing as well
+        # as sampling, so keyboard autorepeat cannot turn this into a busy loop.
+        delay = .2-(time.monotonic()-now)
+        if delay > 0:
+            time.sleep(delay)
 
 
 if __name__ == '__main__':

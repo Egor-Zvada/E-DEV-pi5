@@ -73,7 +73,7 @@ def main(args):
     elif args[0]=='cert-remove':
         certs=json.loads(call('incus','config','trust','list','--format=json'))
         cert=next((c for c in certs if c['fingerprint']==args[1]),None)
-        if not cert or cert.get('name')=='lxconsole': raise ValueError('Сертификат отсутствует или используется LXConsole.')
+        if not cert or cert.get('name') in ('lxconsole','E-DEV LXConsole'): raise ValueError('Сертификат отсутствует или используется LXConsole.')
         call('incus','config','trust','remove',args[1]);print('Доверие сертификату отозвано.')
     else: raise ValueError('Неизвестная операция.')
 

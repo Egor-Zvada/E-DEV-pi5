@@ -48,7 +48,7 @@ def status_text():
     for s in ('incus','lxconsole','smbd','e-dev-guard','e-dev-dns'):
         print(s+':',out(['systemctl','is-active',s]))
     t=P.Path('/sys/class/thermal/thermal_zone0/temp')
-    if t.exists(): print('CPU: %.1f °C'%(int(t.read_text())/1000))
+    if t.exists(): print('Температура CPU: %.1f °C'%(int(t.read_text())/1000))
     stats=out(['free','-m']).splitlines()
     if len(stats)>1:
         values=stats[1].split();print('RAM: '+values[2]+' / '+values[1]+' MiB')
@@ -303,6 +303,8 @@ def main():
     elif cmd=='vpn' and len(tail)==3 and tail[0]=='add': vpn(tail)
     elif cmd=='lan' and tail==['status']:
         sys.exit(run(['/usr/local/sbin/e-dev-lan','status']).returncode)
+    elif cmd=='diagnostics' and tail in ([],['status'],['last'],['events'],['snapshot']):
+        root();sys.exit(run(['/usr/local/sbin/e-dev-diagnostics']+tail).returncode)
     elif cmd=='speedtest' and not tail: vpn(['speedtest'])
     elif cmd=='passwd' and tail==['all']: password('all')
     else: fail('Настройки: e-dev settings. Инструкция: e-dev manuals. Команды: e-dev help')

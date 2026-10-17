@@ -120,10 +120,11 @@ class SettingsTests(unittest.TestCase):
         call.assert_called_once_with('incus','config','set','core.https_address=127.0.0.1:8443')
 
     def test_protected_lxconsole_certificate_cannot_be_revoked(self):
-        with patch.object(actions.os,'geteuid',return_value=0),patch.object(actions,'load'), \
-             patch.object(actions,'call',return_value=json.dumps([dict(name='lxconsole',fingerprint='abc')])) as call:
-            with self.assertRaises(ValueError): actions.main(['cert-remove','abc'])
-        self.assertEqual(call.call_count,1)
+        for name in ('lxconsole','E-DEV LXConsole'):
+            with self.subTest(name=name),patch.object(actions.os,'geteuid',return_value=0),patch.object(actions,'load'), \
+                 patch.object(actions,'call',return_value=json.dumps([dict(name=name,fingerprint='abc')])) as call:
+                with self.assertRaises(ValueError): actions.main(['cert-remove','abc'])
+            self.assertEqual(call.call_count,1)
 
     def test_each_manual_chapter_exists_and_help_is_short(self):
         for name,label in ui.CHAPTERS:

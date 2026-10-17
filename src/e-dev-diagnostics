@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""Bounded local network flight recorder. Observes failures; never changes networking."""
+import collections
+import concurrent.futures as F
+import contextlib
+import datetime as D
+import fcntl
+import ipaddress
+import json
+import os
+import pathlib as P
+import re
+import selectors
+import signal
+import subprocess as S
+import sys
+import time
+
+B = P.Path('/etc/e-dev')
+LOG = P.Path('/var/log/e-dev-diagnostics')
+RUN = P.Path('/run/e-dev-diagnostics')
+LOCK_ROOT = P.Path('/run')
+INTERVAL = 10
+PROBE_INTERVAL = 60
+MAX_BYTES = 128 * 1024**2
+ROTATE_BYTES = 4 * 1024**2
+MAC = r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}'
+UNITS = ('NetworkManager.service', 'e-dev-dns.service', 'e-dev-guard.service')
+
+
+def clean(value, limit=700):
+    text = str(value)
+    text = re.sub(r'''(?ix)\b(privatekey|presharedkey|password|psk|token|secret)\b["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)''', r'\1=[hidden]', text)
+    return ''.join(c if c.isprintable() else ' ' for c in text)[:limit]
+
+
+def read(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def number(path, scale=1):
+    try:
+        return round(float(P.Path(path).read_text().strip()) / scale, 2)
+    except (OSError, ValueError):
+        return None
+
+
+def command(*args, timeout=3):
+    try:
+        r = S.run(args, text=True, capture_output=True, stdin=S.DEVNULL, timeout=timeout,
+                  env=dict(os.environ, LC_ALL='C', SYSTEMD_PAGER='cat', PAGER='cat'))
+        return r.returncode, r.stdout[:262144]
+    except (OSError, S.TimeoutExpired):
+        return -1, ''
+
+
+def atomic(path, data):
+    temporary = path.with_name(path.name + '.new')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        json.dump(data, stream, ensure_ascii=False)
+        stream.write('\n')
+    temporary.replace(path)
+
+
+def config():
+    wifi = read(B/'wifi.json', {})
+    state = read(P.Path('/run/e-dev-lan-state.json'), {})
+    active = state.get('active')
+    link = state.get('links', {}).get(active, {})
+    def word(name, fallback=''):
+        try:
+            return clean((B/name).read_text().strip(), 64)
+        except OSError:
+            return fallback
+    return dict(mode=word('mode', 'blocked'), profile=word('selected-profile'),
+                vpn_enabled=word('vpn-enabled', 'on') == 'on',
+                selection=read(B/'vpn-policy.json', {}).get('mode', 'unknown'),
+                out='edevbr0' if wifi.get('interface') == 'edevbr0' else 'wlan0',
+                ap=str(wifi.get('address', '10.42.0.1/24')).split('/')[0],
+                uplink=link.get('ifname') or ('eth0' if not (B/'lan.json').exists() else None))
+
+
+def maintenance():
+    # Taking a shared, nonblocking lock only checks whether a controller is busy.
+    # Never wait for it and never acquire locks that could block a network change.
+    # The policy lock is also held during outage probes and speed tests; treating
+    # those as maintenance would hide the very VPN failures we need to record.
+    for name in ('e-dev-wifi', 'e-dev-vpn'):
+        try:
+            with open(LOCK_ROOT/(name+'.lock'), 'r') as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+        except FileNotFoundError:
+            pass
+    return False
+
+
+def stations(text):
+    result = []
+    for block in re.split(r'(?m)^Station ', text)[1:]:
+        match = re.match('('+MAC+')', block, re.I)
+        if not match:
+            continue
+        row = dict(mac=match[1].lower())
+        for label, key in (('rx bytes', 'rx_bytes'), ('tx bytes', 'tx_bytes'),
+                           ('tx failed', 'tx_failed'), ('connected time', 'connected_s'),
+                           ('inactive time', 'inactive_ms'), ('signal', 'signal_dbm'),
+                           ('tx bitrate', 'tx_mbps'), ('rx bitrate', 'rx_mbps')):
+            found = re.search(r'(?m)^\s*'+label+r':\s*(-?[0-9.]+)', block)
+            if found:
+                row[key] = float(found[1]) if 'mbps' in key else int(float(found[1]))
+        result.append(row)
+    return result
+
+
+class Collector:
+    def __init__(self):
+        self.cpu = None
+
+    def sample(self):
+        row = dict(time=time.time(), config=config(), maintenance=maintenance())
+        row['temperature_c'] = number('/sys/class/thermal/thermal_zone0/temp', 1000)
+        try:
+            row['memory_controller'] = 'memory' in P.Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()
+        except OSError:
+            row['memory_controller'] = None
+        row['cpu_mhz'] = number('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq', 1000)
+        row['load'] = list(os.getloadavg())
+        _, text = command('vcgencmd', 'get_throttled')
+        found = re.search(r'0x[0-9a-f]+', text, re.I)
+        row['throttled'] = int(found[0], 16) if found else None
+        try:
+            fields = [int(v) for v in P.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]]
+            current = sum(fields), fields[3] + fields[4]
+            total = current[0] - self.cpu[0] if self.cpu else 0
+            row['cpu_percent'] = round(100*(1-(current[1]-self.cpu[1])/total), 1) if total > 0 else None
+            self.cpu = current
+            mem = dict(re.findall(r'(?m)^(MemTotal|MemAvailable):\s+(\d+)', P.Path('/proc/meminfo').read_text()))
+            row['ram_used_mib'] = round((int(mem['MemTotal'])-int(mem['MemAvailable']))/1024, 1)
+        except (OSError, ValueError, KeyError, IndexError):
+            pass
+        rc, text = command('iw', 'dev', 'wlan0', 'station', 'dump')
+        row['stations'] = stations(text)
+        row['station_read_ok'] = rc == 0
+        _, text = command('ip', '-j', '-s', 'link')
+        try:
+            row['links'] = [dict(name=x['ifname'], mtu=x.get('mtu'), state=x.get('operstate'),
+                                 stats=x.get('stats64', x.get('stats', {}))) for x in json.loads(text)]
+        except (ValueError, KeyError):
+            row['links'] = []
+        port = P.Path('/sys/class/net/wlan0/brport/state')
+        row['ap_forwarding'] = number(port) == 3 if row['config']['out'] == 'edevbr0' else P.Path('/sys/class/net/wlan0').exists()
+        _, text = command('systemctl', 'show', *UNITS, '-p', 'Id,ActiveState,Result,NRestarts')
+        row['services'] = {}
+        for block in text.strip().split('\n\n'):
+            values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+            if values.get('Id'):
+                row['services'][values.pop('Id')] = values
+        rc, text = command('awg', 'show', 'awg0', 'latest-handshakes')
+        stamps = [int(line.split()[-1]) for line in text.splitlines() if re.fullmatch(r'\S+\s+\d+', line)]
+        row['vpn_interface'] = rc == 0
+        row['handshake_age_s'] = max(0, int(time.time())-max(stamps)) if stamps and max(stamps) else None
+        return row
+
+
+def http_probe(dev):
+    if not dev:
+        return dict(ok=False, reason='no-interface')
+    start = time.monotonic()
+    for address in ('1.1.1.1', '1.0.0.1'):
+        rc, text = command('curl', '--noproxy', '*', '--interface', dev, '-4', '-sS',
+                           '--connect-timeout', '2', '--max-time', '3', '-o', '/dev/null',
+                           '-w', '%{http_code}', 'https://'+address+'/cdn-cgi/trace', timeout=4)
+        if rc == 0 and text.strip() == '200':
+            return dict(ok=True, ms=round((time.monotonic()-start)*1000))
+    return dict(ok=False, reason='https-unreachable')
+
+
+def dns_probe(address, port):
+    start = time.monotonic()
+    rc, text = command('dig', '+time=2', '+tries=1', '+noall', '+comments', '+answer',
+                       '@'+address, '-p', str(port), 'example.com', 'A', timeout=3)
+    ok = rc == 0 and 'status: NOERROR' in text and bool(re.search(r'\sIN\s+A\s+[0-9.]+', text))
+    return dict(ok=ok, ms=round((time.monotonic()-start)*1000))
+
+
+def journal_event(row):
+    message = row.get('MESSAGE', '')
+    if not isinstance(message, str):
+        return None
+    timestamp = row.get('__REALTIME_TIMESTAMP', '')
+    try:
+        stamp = int(timestamp)/1000000
+    except (ValueError, TypeError):
+        stamp = time.time()
+    match = re.search(r'\bDHCP(DISCOVER|OFFER|REQUEST|ACK|NAK)\(([^)]+)\).*?('+MAC+r')\b', message, re.I)
+    if match:
+        event = dict(time=stamp, kind='dhcp', phase=match[1].upper(), interface=clean(match[2], 32), mac=match[3].lower())
+        address = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', message)
+        if address:
+            try:
+                event['address'] = str(ipaddress.IPv4Address(address[0]))
+            except ValueError:
+                pass
+        return event
+    match = re.search(r'\bAP-STA-(CONNECTED|DISCONNECTED)\s+('+MAC+')', message, re.I)
+    if match:
+        return dict(time=stamp, kind='wifi-auth', state=match[1].lower(), mac=match[2].lower())
+    match = re.search(r'device \(([^)]+)\): state change: ([a-z-]+) -> ([a-z-]+)', message)
+    if match:
+        return dict(time=stamp, kind='interface-state', interface=clean(match[1], 32), previous=match[2], state=match[3])
+    unit = row.get('_SYSTEMD_UNIT', '')
+    if unit in ('e-dev-dns.service', 'e-dev-auto.service', 'e-dev-vpn-health.service',
+                'e-dev-uplink.service', 'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
+        return dict(time=stamp, kind='service-event', unit=unit, message=clean(message))
+    if re.search(r'brcmf|cfg80211|wlan0|under.?voltage|out of memory|oom-kill', message, re.I) and re.search(r'error|fail|timeout|timed out|crash|hang|under.?voltage|out of memory|oom-kill', message, re.I):
+        return dict(time=stamp, kind='kernel-warning', message=clean(message))
+    return None
+
+
+def wireless_event(line):
+    if re.search(r'new station|del station|connected|disconnect|deauth|beacon loss|failed|CQM', line, re.I):
+        return dict(time=time.time(), kind='wireless-event', message=clean(line))
+    return None
+
+
+class Detector:
+    def __init__(self):
+        self.failures = collections.Counter()
+        self.pending = {}
+        self.last_incident = {}
+        self.flags = 0
+        self.seen_dhcp = collections.deque(maxlen=1024)
+        self.grace_until = time.time() + 60
+
+    def incident(self, key, now, detail):
+        if now - self.last_incident.get(key, -10000) < 300:
+            return None
+        self.last_incident[key] = now
+        return dict(time=now, kind=key, observation=detail)
+
+    def dhcp(self, event, out):
+        if event['kind'] != 'dhcp' or event['interface'] != out:
+            return
+        identity = (event['time'], event['phase'], event['interface'], event['mac'])
+        if identity in self.seen_dhcp:
+            return
+        self.seen_dhcp.append(identity)
+        mac = event['mac']
+        if event['phase'] == 'ACK':
+            self.pending.pop(mac, None)
+        else:
+            state = self.pending.setdefault(mac, dict(first=event['time'], last=event['time'], discover=0, offer=0))
+            state['last'] = event['time']
+            if event['phase'] in ('DISCOVER', 'OFFER'):
+                state[event['phase'].lower()] += 1
+        # A bounded cache, including on a noisy or hostile client network.
+        if len(self.pending) > 512:
+            oldest = min(self.pending, key=lambda m: self.pending[m]['last'])
+            del self.pending[oldest]
+
+    def check(self, sample, probes=None):
+        now = sample['time']
+        if sample['maintenance']:
+            self.grace_until = now + 45
+            self.failures.clear()
+            self.pending.clear()
+        if now < self.grace_until:
+            return []
+        issues = []
+        flags = sample.get('throttled')
+        if flags is not None:
+            if flags & ~self.flags:
+                issues.append(('hardware-flags', 'Зафиксированы флаги питания/ограничения частоты: '+hex(flags)))
+            self.flags = flags
+        hot = sample.get('temperature_c')
+        conditions = {'temperature': hot is not None and hot >= 80,
+                      'ap-forwarding': not sample.get('ap_forwarding', True)}
+        conditions.update({'service:'+unit: values.get('ActiveState') != 'active'
+                           for unit, values in sample.get('services', {}).items()})
+        if probes:
+            conditions.update({'probe:'+name: not result['ok'] for name, result in probes.items() if not result.get('skipped')})
+        for key, failed in conditions.items():
+            self.failures[key] = self.failures[key] + 1 if failed else 0
+            if self.failures[key] >= (1 if key == 'temperature' else 3):
+                issues.append((key, 'Повторяющаяся ошибка проверки: '+key))
+        for mac, state in list(self.pending.items()):
+            if now - state['last'] > 300:
+                del self.pending[mac]
+            elif state['discover'] >= 2 and state['offer'] >= 1 and now-state['first'] >= 30:
+                issues.append(('dhcp:'+mac, 'Повторные DHCP DISCOVER/OFFER без последующего ACK: '+mac+'. Причина потери обмена не установлена.'))
+        return [issue for key, detail in issues if (issue := self.incident(key, now, detail))]
+
+
+class Store:
+    def __init__(self, directory=LOG):
+        self.directory = directory
+        if directory.is_symlink():
+            raise ValueError('Каталог журнала не должен быть символической ссылкой.')
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+    @contextlib.contextmanager
+    def lock(self):
+        fd = os.open(self.directory/'.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            yield
+
+    def managed(self):
+        return [p for p in self.directory.iterdir() if not p.is_symlink() and
+                (re.fullmatch(r'(?:samples|events)(?:\.[1-3])?\.jsonl', p.name) or
+                 re.fullmatch(r'incident-[0-9]+\.json', p.name)) and p.is_file()]
+
+    def prune(self, reserve=0):
+        if reserve > MAX_BYTES:
+            raise ValueError('Снимок превышает лимит журнала.')
+        files = self.managed()
+        incidents = sorted((p for p in files if p.name.startswith('incident-')), key=lambda p:p.stat().st_mtime)
+        for path in incidents[:-12]:
+            path.unlink()
+        for path in incidents[-12:]:
+            if path.stat().st_mtime < time.time()-7*86400:
+                path.unlink()
+        files = self.managed()
+        size = sum(p.stat().st_size for p in files)
+        for path in sorted(files, key=lambda p:p.stat().st_mtime):
+            if size + reserve <= MAX_BYTES:
+                break
+            size -= path.stat().st_size
+            path.unlink()
+
+    def append(self, kind, row):
+        data = json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n'
+        with self.lock():
+            path = self.directory/(kind+'.jsonl')
+            if path.is_symlink():
+                raise ValueError('Файл журнала не должен быть символической ссылкой.')
+            if path.exists() and path.stat().st_size + len(data.encode()) > ROTATE_BYTES:
+                for index in (3, 2, 1):
+                    old = self.directory/(kind+'.'+str(index)+'.jsonl')
+                    if old.exists():
+                        if index == 3:
+                            old.unlink()
+                        else:
+                            old.replace(self.directory/(kind+'.'+str(index+1)+'.jsonl'))
+                path.replace(self.directory/(kind+'.1.jsonl'))
+            self.prune(len(data.encode()))
+            if path.exists() and path.stat().st_size:
+                with path.open('rb') as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    if stream.read(1) != b'\n':
+                        data = '\n'+data
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(data)
+
+    def tail(self, kind, count):
+        result = collections.deque(maxlen=count)
+        with self.lock():
+            for suffix in ('.3', '.2', '.1', ''):
+                path = self.directory/(kind+suffix+'.jsonl')
+                if path.exists() and not path.is_symlink():
+                    with path.open() as stream:
+                        for line in stream:
+                            try:
+                                result.append(json.loads(line))
+                            except ValueError:
+                                pass  # A last line can be incomplete after sudden power loss.
+        return list(result)
+
+    def snapshot(self, reason, sample):
+        document = dict(reason=reason, sample=sample, samples=self.tail('samples', 60),
+                        events=self.tail('events', 200), network={})
+        for name, args in (
+            ('addresses', ('ip', '-j', '-4', 'addr')),
+            ('routes', ('ip', '-j', '-4', 'route', 'show', 'table', 'all')),
+            ('rules', ('ip', '-j', '-4', 'rule')),
+            ('neighbors', ('ip', '-j', 'neigh'))):
+            rc, text = command(*args)
+            try:
+                document['network'][name] = json.loads(text) if rc == 0 else None
+            except ValueError:
+                document['network'][name] = None
+        with self.lock():
+            path = self.directory/('incident-'+str(time.time_ns())+'.json')
+            size = len(json.dumps(document, ensure_ascii=False).encode()) + 1
+            self.prune(size)
+            atomic(path, document)
+            self.prune()
+        return path
+
+
+def journal_process():
+    filters = []
+    for unit in ('NetworkManager.service', 'wpa_supplicant.service', 'e-dev-dns.service',
+                 'e-dev-auto.service', 'e-dev-vpn-health.service', 'e-dev-uplink.service',
+                 'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
+        filters.extend((['_SYSTEMD_UNIT='+unit] if not filters else ['+', '_SYSTEMD_UNIT='+unit]))
+    return S.Popen(['journalctl', '--follow', '--since=-30seconds', '--no-pager', '--output=json',
+                    *filters, '+', '_TRANSPORT=kernel'], stdout=S.PIPE, stderr=S.DEVNULL)
+
+
+def daemon():
+    RUN.mkdir(parents=True, exist_ok=True, mode=0o700)
+    store, collector, detector = Store(), Collector(), Detector()
+    stop = False
+    def finish(signum, frame):
+        nonlocal stop
+        stop = True
+    signal.signal(signal.SIGTERM, finish)
+    signal.signal(signal.SIGINT, finish)
+    selector, pool = selectors.DefaultSelector(), F.ThreadPoolExecutor(max_workers=4)
+    children = {'journal':None, 'wireless':None}
+    buffers = dict.fromkeys(children, b'')
+    retries = dict.fromkeys(children, 0)
+    next_sample = next_probe = 0
+    pending, probes, probe_config = {}, {}, None
+    last_clients = None
+    last_issue = None
+    last_config = None
+    probe_time = None
+    try:
+        while not stop:
+            now = time.monotonic()
+            for source in children:
+                if children[source] is None and now >= retries[source]:
+                    try:
+                        child = journal_process() if source == 'journal' else S.Popen(['iw','event','-t'],stdout=S.PIPE,stderr=S.DEVNULL)
+                        os.set_blocking(child.stdout.fileno(), False)
+                        selector.register(child.stdout, selectors.EVENT_READ, source)
+                        children[source] = child
+                    except OSError:
+                        retries[source] = now + 10
+            for key, _ in selector.select(0.5):
+                source = key.data
+                data = os.read(key.fd, 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    children[source].wait(timeout=1)
+                    children[source] = None
+                    retries[source] = now + 5
+                    buffers[source] = b''
+                    continue
+                buffers[source] += data
+                while b'\n' in buffers[source]:
+                    line, buffers[source] = buffers[source].split(b'\n', 1)
+                    try:
+                        event = journal_event(json.loads(line)) if source == 'journal' else wireless_event(line.decode('utf-8','replace'))
+                    except (ValueError, TypeError):
+                        event = None
+                    if event:
+                        store.append('events', event)
+                        detector.dhcp(event, config()['out'])
+                        if event['kind'] == 'kernel-warning' and time.time() >= detector.grace_until and not maintenance():
+                            issue = detector.incident('kernel-warning', event['time'], event['message'])
+                            if issue:
+                                last_issue = str(store.snapshot(issue, collector.sample()))
+                if len(buffers[source]) > 262144:
+                    buffers[source] = b''
+            if now < next_sample:
+                continue
+            next_sample = now + INTERVAL
+            sample = collector.sample()
+            if last_config is not None and sample['config'] != last_config:
+                probes = {}
+                probe_time = None
+                detector.failures.clear()
+                detector.pending.clear()
+                detector.grace_until = sample['time'] + 45
+            last_config = sample['config']
+            clients = {row['mac'] for row in sample['stations']}
+            if sample['station_read_ok']:
+                if last_clients is not None:
+                    for kind, entries in (('wifi-joined', clients-last_clients), ('wifi-left', last_clients-clients)):
+                        for mac in entries:
+                            store.append('events', dict(time=sample['time'], kind=kind, mac=mac))
+                last_clients = clients
+            fresh = None
+            if pending and all(future.done() for future in pending.values()):
+                # Results from before a route/profile change cannot describe the new state.
+                if sample['config'] == probe_config and not sample['maintenance']:
+                    probes = {name:future.result() for name, future in pending.items()}
+                    probe_time = sample['time']
+                    fresh = probes
+                    store.append('events', dict(time=sample['time'], kind='probes', results=probes))
+                pending = {}
+            sample['probes'] = probes
+            sample['probe_time'] = probe_time
+            if now >= next_probe and not pending and not sample['maintenance']:
+                next_probe = now + PROBE_INTERVAL
+                probe_config = sample['config']
+                pending = {'provider':pool.submit(http_probe, probe_config['uplink']),
+                           'dns-ap':pool.submit(dns_probe, probe_config['ap'], 53)}
+                if probe_config['vpn_enabled']:
+                    pending['vpn'] = pool.submit(http_probe, 'awg0')
+                    pending['dns-vpn'] = pool.submit(dns_probe, probe_config['ap'], 1053)
+            store.append('samples', sample)
+            for issue in detector.check(sample, fresh):
+                last_issue = str(store.snapshot(issue, sample))
+                print(clean(issue['observation']), flush=True)
+            atomic(RUN/'status.json', dict(time=sample['time'], sample=sample, last_incident=last_issue,
+                                          journal_connected=children['journal'] is not None,
+                                          wireless_connected=children['wireless'] is not None))
+    finally:
+        for child in children.values():
+            if child and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=2)
+                except S.TimeoutExpired:
+                    child.kill()
+        pool.shutdown(wait=False, cancel_futures=True)
+        selector.close()
+
+
+def show_snapshot(document, path):
+    reason, sample = document['reason'], document['sample']
+    print('Снимок: '+str(path))
+    print('Время: '+D.datetime.fromtimestamp(reason['time']).astimezone().isoformat(timespec='seconds'))
+    print('Наблюдение: '+clean(reason['observation']))
+    print('CPU: '+str(sample.get('temperature_c'))+' °C; флаги: '+str(sample.get('throttled')))
+    conf = sample.get('config', {})
+    print('AP: '+conf.get('mode', '?').upper()+'; VPN: '+conf.get('profile', '?')+' / '+conf.get('selection', '?').upper())
+    print('Wi-Fi клиентов в снимке: '+str(len(sample.get('stations', []))))
+    for event in document.get('events', [])[-12:]:
+        print(clean(json.dumps(event, ensure_ascii=False)))
+    print('Наблюдение фиксирует симптомы; первопричина требует сопоставления событий.')
+
+
+def main(args):
+    if args not in ([], ['status'], ['last'], ['events'], ['snapshot'], ['daemon']):
+        raise ValueError('e-dev diagnostics [status|last|events|snapshot]')
+    if os.geteuid() != 0:
+        raise ValueError('Нужен sudo: e-dev diagnostics')
+    if args == ['daemon']:
+        return daemon()
+    store = Store()
+    if args == ['snapshot']:
+        sample = Collector().sample()
+        reason = dict(time=sample['time'], kind='manual', observation='Снимок по запросу пользователя.')
+        path = store.snapshot(reason, sample)
+        return show_snapshot(read(path), path)
+    if args == ['last']:
+        paths = sorted((p for p in store.managed() if p.name.startswith('incident-')), key=lambda p:p.stat().st_mtime)
+        if not paths:
+            print('Снимков пока нет. Создать: e-dev diagnostics snapshot')
+            return
+        return show_snapshot(read(paths[-1]), paths[-1])
+    if args == ['events']:
+        for event in store.tail('events', 30):
+            print(clean(json.dumps(event, ensure_ascii=False)))
+        return
+    status = read(RUN/'status.json', {})
+    rc, output = command('systemctl', 'is-active', 'e-dev-diagnostics.service')
+    print('Регистратор: '+output.strip()+'; интервал 10 с, сетевые проверки 60 с.')
+    print('Данные: '+str(LOG)+'; лимит 128 MiB, до 12 снимков за 7 дней.')
+    if status:
+        print('Последний отсчёт: '+str(round(time.time()-status['time']))+' с назад; журнал событий: '+('подключён' if status['journal_connected'] else 'переподключается'))
+        print('Проверки: '+clean(json.dumps(status['sample'].get('probes', {}), ensure_ascii=False)))
+        if status['sample'].get('memory_controller') is False:
+            print('ВНИМАНИЕ: memory cgroup выключен, лимиты памяти не применяются. Проверьте параметры загрузки.')
+    print('Последний снимок: e-dev diagnostics last; создать сейчас: e-dev diagnostics snapshot')
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except (OSError, ValueError, S.SubprocessError) as error:
+        print('Регистратор: '+clean(error), file=sys.stderr)
+        sys.exit(1)

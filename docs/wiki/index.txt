@@ -9,6 +9,8 @@ Egor Zvada • E-DEV • egor-zvada.ru
   e-dev wifi status       точка и режим трафика
   e-dev lan status        входы интернета и OUT-порты
   e-dev vpn status        туннель, профиль и handshake
+  e-dev diagnostics       состояние постоянного регистратора
+  e-dev diagnostics last  последний снимок сбоя
   e-dev speedtest         скорость активного VPN
   e-dev passwd all        общий новый пароль SSH, UI, SMB и AP
   e-dev manuals           инструкция по главам

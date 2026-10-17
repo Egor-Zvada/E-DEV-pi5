@@ -19,6 +19,7 @@ if [[ -f /etc/systemd/journald.conf.d/e-dev.conf ]]; then
 fi
 chmod -R go-rwx "$BACKUP_DIR"
 bash "$REPO_DIR/scripts/deploy.sh"
+python3 "$REPO_DIR/scripts/configure_kernel.py"
 if ! command -v dialog >/dev/null || ! command -v ethtool >/dev/null; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y dialog ethtool

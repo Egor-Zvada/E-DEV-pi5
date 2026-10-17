@@ -29,6 +29,8 @@ e-dev wifi status       AP и режим трафика
 e-dev lan status        входы интернета и OUT-порты
 e-dev vpn status        профиль, туннель и handshake
 e-dev speedtest         скорость активного VPN
+e-dev diagnostics       состояние постоянного регистратора
+e-dev diagnostics last  последний снимок
 e-dev passwd all        общий новый пароль SSH / UI / SMB / AP
 e-dev manuals           инструкция с выбором глав
 man e-dev               системная man-страница
@@ -59,6 +61,8 @@ sudo ./install.sh --country RU
 Общий пароль SSH/SMB/LXConsole/AP запрашивается скрыто: 8–63 печатных ASCII-символа, без передачи через argv. В Git нет пароля по умолчанию. Установка рассчитана на чистую Pi OS; существующий E-DEV/Incus с данными не перезаписывается. После прерванного начального bootstrap допускается повторный запуск. Снимки прежних настроек: `/opt/e-dev/backups/install-*`.
 
 Перезайти по SSH для группы `incus-admin`, приветствия и Tab. Открыть `e-dev settings`. Новый OUT-интернет закрыт до выбора прямого режима или настройки VPN.
+
+Для ограничений памяти Incus нужен memory cgroup. Установщик сохраняет исходный `cmdline.txt` и при необходимости добавляет `cgroup_enable=memory`. Если он сообщает о необходимости перезагрузки, выполните `sudo reboot`: после неё в `/sys/fs/cgroup/cgroup.controllers` должно появиться `memory`.
 
 ### Первый VPN
 

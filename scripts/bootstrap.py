@@ -152,7 +152,7 @@ def init_lxconsole(args, password):
                       '-fingerprint', '-sha256', stdout=S.PIPE).stdout.partition('=')[2].strip().replace(':', '').lower()
     trusted = json.loads(incus('config', 'trust', 'list', '--format=json'))
     if not any(c['fingerprint'].lower() == fingerprint for c in trusted):
-        incus('config', 'trust', 'add-certificate', str(path/'certs/client.crt'), '--name=E-DEV LXConsole')
+        incus('config', 'trust', 'add-certificate', str(path/'certs/client.crt'), '--name=lxconsole')
 
 
 def initial_settings(args):
@@ -305,6 +305,8 @@ def main():
     else:
         raise ValueError('Применение LAN ещё не завершилось: journalctl -u e-dev-lan-apply')
     run('systemctl','enable','--now','e-dev-network.service','e-dev-uplink.timer')
+    run('systemctl','enable','--now','e-dev-diagnostics.service')
+    run('python3',str(REPO/'scripts/configure_kernel.py'))
     run('/usr/local/sbin/e-dev-geo-update', check=False)
     manifest = {'installed': datetime.datetime.now().astimezone().isoformat(), 'user': args.user,
                 'hostname': args.hostname, 'country': args.country, 'timezone': args.timezone}

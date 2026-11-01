@@ -191,6 +191,21 @@ def dns_probe(address, port):
     return dict(ok=ok, ms=round((time.monotonic()-start)*1000))
 
 
+def start_probes(pool, conf):
+    # Check the DNS path clients actually use. In VPN/HYBRID port 53 is
+    # redirected to 1053; querying NM's direct upstream is not an AP DNS test.
+    port=53 if conf['mode']=='direct' else 1053
+    futures={'provider':pool.submit(http_probe,conf['uplink'])}
+    if port==1053 and not conf['vpn_enabled']:
+        ready=F.Future();ready.set_result(dict(ok=True,skipped=True,reason='vpn-disabled'))
+        futures['dns-ap']=ready
+    else:futures['dns-ap']=pool.submit(dns_probe,conf['ap'],port)
+    if conf['vpn_enabled']:
+        futures['vpn']=pool.submit(http_probe,'awg0')
+        futures['dns-vpn']=futures['dns-ap'] if port==1053 else pool.submit(dns_probe,conf['ap'],1053)
+    return futures
+
+
 def journal_event(row):
     message = row.get('MESSAGE', '')
     if not isinstance(message, str):
@@ -217,7 +232,7 @@ def journal_event(row):
     if match:
         return dict(time=stamp, kind='interface-state', interface=clean(match[1], 32), previous=match[2], state=match[3])
     unit = row.get('_SYSTEMD_UNIT', '')
-    if unit in ('incus.service', 'incus-startup.service', 'e-dev-dns.service', 'e-dev-auto.service', 'e-dev-vpn-health.service',
+    if unit in ('incus.service', 'incus-startup.service', 'e-dev-radio-health.service', 'e-dev-dns.service', 'e-dev-auto.service', 'e-dev-vpn-health.service',
                 'e-dev-uplink.service', 'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
         return dict(time=stamp, kind='service-event', unit=unit, message=clean(message))
     if re.search(r'brcmf|cfg80211|wlan0|under.?voltage|out of memory|oom-kill', message, re.I) and re.search(r'error|fail|timeout|timed out|crash|hang|under.?voltage|out of memory|oom-kill', message, re.I):
@@ -401,7 +416,7 @@ class Store:
 
 def journal_process():
     filters = []
-    for unit in ('NetworkManager.service', 'wpa_supplicant.service', 'incus.service', 'incus-startup.service', 'e-dev-dns.service',
+    for unit in ('NetworkManager.service', 'wpa_supplicant.service', 'incus.service', 'incus-startup.service', 'e-dev-radio-health.service', 'e-dev-dns.service',
                  'e-dev-auto.service', 'e-dev-vpn-health.service', 'e-dev-uplink.service',
                  'e-dev-wifi-apply.service', 'e-dev-lan-apply.service', 'e-dev-vpn.service'):
         filters.extend((['_SYSTEMD_UNIT='+unit] if not filters else ['+', '_SYSTEMD_UNIT='+unit]))
@@ -499,11 +514,7 @@ def daemon():
             if now >= next_probe and not pending and not sample['maintenance']:
                 next_probe = now + PROBE_INTERVAL
                 probe_config = sample['config']
-                pending = {'provider':pool.submit(http_probe, probe_config['uplink']),
-                           'dns-ap':pool.submit(dns_probe, probe_config['ap'], 53)}
-                if probe_config['vpn_enabled']:
-                    pending['vpn'] = pool.submit(http_probe, 'awg0')
-                    pending['dns-vpn'] = pool.submit(dns_probe, probe_config['ap'], 1053)
+                pending = start_probes(pool, probe_config)
             store.append('samples', sample)
             for issue in detector.check(sample, fresh):
                 last_issue = str(store.snapshot(issue, sample))
@@ -538,16 +549,17 @@ def show_snapshot(document, path):
 
 
 def main(args):
-    if args not in ([], ['status'], ['last'], ['events'], ['snapshot'], ['daemon']):
+    if args not in ([], ['status'], ['last'], ['events'], ['snapshot'], ['snapshot-radio'], ['daemon']):
         raise ValueError('e-dev diagnostics [status|last|events|snapshot]')
     if os.geteuid() != 0:
         raise ValueError('Нужен sudo: e-dev diagnostics')
     if args == ['daemon']:
         return daemon()
     store = Store()
-    if args == ['snapshot']:
+    if args in (['snapshot'], ['snapshot-radio']):
         sample = Collector().sample()
-        reason = dict(time=sample['time'], kind='manual', observation='Снимок по запросу пользователя.')
+        radio=args==['snapshot-radio']
+        reason = dict(time=sample['time'], kind='radio-recovery' if radio else 'manual', observation='Повторная ошибка радио; снимок перед автоматическим восстановлением.' if radio else 'Снимок по запросу пользователя.')
         path = store.snapshot(reason, sample)
         return show_snapshot(read(path), path)
     if args == ['last']:
@@ -564,6 +576,9 @@ def main(args):
     rc, output = command('systemctl', 'is-active', 'e-dev-diagnostics.service')
     print('Регистратор: '+output.strip()+'; интервал 10 с, сетевые проверки 60 с.')
     print('Данные: '+str(LOG)+'; лимит 128 MiB, до 12 снимков за 7 дней.')
+    radio=read(P.Path('/var/lib/e-dev/radio-health.json'),{})
+    if radio:
+        print('Радио: '+str(radio.get('observed','?'))+'; подряд ошибок: '+str(radio.get('failures',0))+'; последнее восстановление: '+str(radio.get('last_result','не требовалось')))
     if status:
         print('Последний отсчёт: '+str(round(time.time()-status['time']))+' с назад; журнал событий: '+('подключён' if status['journal_connected'] else 'переподключается')+'; Wi-Fi события: '+('подключены' if status.get('wireless_connected') else 'переподключаются'))
         print('Проверки: '+clean(json.dumps(status['sample'].get('probes', {}), ensure_ascii=False)))

@@ -8,7 +8,7 @@ import pathlib as P
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 ROOT = P.Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader('diagnostics_test', str(ROOT/'src/e-dev-diagnostics'))
@@ -30,6 +30,18 @@ def event(phase, stamp=100, interface='edevbr0'):
 
 
 class EventTests(unittest.TestCase):
+    def test_dns_probe_matches_actual_ap_mode_and_shares_vpn_dns_check(self):
+        conf=dict(mode='hybrid',vpn_enabled=True,uplink='eth0',ap='10.42.0.1')
+        pool=Mock()
+        jobs=d.start_probes(pool,conf)
+        self.assertIs(jobs['dns-ap'],jobs['dns-vpn'])
+        self.assertEqual([c.args for c in pool.submit.call_args_list if c.args[0]==d.dns_probe],[(d.dns_probe,'10.42.0.1',1053)])
+        pool.reset_mock();jobs=d.start_probes(pool,dict(conf,mode='direct'))
+        self.assertEqual([c.args[2] for c in pool.submit.call_args_list if c.args[0]==d.dns_probe],[53,1053])
+        pool.reset_mock();jobs=d.start_probes(pool,dict(conf,vpn_enabled=False))
+        self.assertTrue(jobs['dns-ap'].result()['skipped'])
+        self.assertFalse(any(c.args[0]==d.dns_probe for c in pool.submit.call_args_list))
+
     def test_dhcp_extracts_metadata_without_recording_message_body(self):
         row = dict(MESSAGE='DHCPACK(edevbr0) 10.42.0.43 '+CLIENT+' arbitrary-hostname',
                    __REALTIME_TIMESTAMP='123000000')

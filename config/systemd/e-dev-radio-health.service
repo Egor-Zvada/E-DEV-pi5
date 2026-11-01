@@ -1,0 +1,10 @@
+[Unit]
+Description=E-DEV bounded recovery of unresponsive built-in AP firmware
+After=NetworkManager.service e-dev-network.service
+ConditionPathExists=/etc/e-dev/mode
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-radio health
+TimeoutStartSec=120
+UMask=0077

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Recover a repeatedly unresponsive built-in AP without rebooting the router."""
+import fcntl
+import json
+import os
+import pathlib as P
+import subprocess as S
+import sys
+import time
+
+STATE=P.Path('/var/lib/e-dev/radio-health.json')
+BASE=P.Path('/etc/e-dev')
+MINIMAL='/usr/lib/firmware/cypress/cyfmac43455-sdio-minimal.bin'
+
+
+def call(*args,timeout=8):
+    try:
+        return S.run(args,text=True,capture_output=True,stdin=S.DEVNULL,timeout=timeout,env=dict(os.environ,LC_ALL='C'))
+    except (OSError,S.TimeoutExpired):
+        return S.CompletedProcess(args,124,'','command unavailable or timed out')
+
+
+def read(path,default):
+    try:return json.loads(path.read_text())
+    except (OSError,ValueError):return default
+
+
+def save(state):
+    STATE.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    fd=os.open(STATE.with_suffix('.new'),os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+    os.fchmod(fd,0o600)
+    with os.fdopen(fd,'w') as stream:json.dump(state,stream);stream.write('\n')
+    STATE.with_suffix('.new').replace(STATE)
+
+
+def supported():
+    try:return 'Raspberry Pi 5' in P.Path('/proc/device-tree/model').read_text()
+    except OSError:return False
+
+
+def other_broadcom_inputs():
+    plan=read(BASE/'lan.json',{})
+    for entry in plan.get('inputs',{}).values():
+        for dev in P.Path('/sys/class/net').iterdir():
+            try:
+                if (dev/'address').read_text().strip().lower()==entry['mac'].lower() and (dev/'device/driver/module').resolve().name=='brcmfmac':return True
+            except (OSError,KeyError):pass
+    return False
+
+
+def radio_state():
+    # A configured but deliberately disabled radio must stay disabled.
+    result=call('nmcli','radio','wifi')
+    if result.returncode or result.stdout.strip()!='enabled':return 'disabled'
+    mode=call('nmcli','-g','802-11-wireless.mode','con','show','E-DEV-AP')
+    if mode.returncode or mode.stdout.strip()!='ap':return 'disabled'
+    state=call('nmcli','-g','GENERAL.STATE','device','show','wlan0')
+    if state.returncode or not state.stdout.startswith('100'):return 'inactive'
+    # No clients is healthy. These commands test firmware responsiveness, not
+    # whether a sleeping client answers ping or whether the ISP is reachable.
+    info=call('iw','dev','wlan0','info',timeout=4)
+    stations=call('iw','dev','wlan0','station','dump',timeout=4)
+    return 'healthy' if info.returncode==0 and stations.returncode==0 and 'type AP' in info.stdout else 'unresponsive'
+
+
+def recent_firmware_failure():
+    r=call('journalctl','-b','-k','--since=-3minutes','--no-pager','-o','cat')
+    return r.returncode==0 and any(x in r.stdout for x in ('brcmf_fw_crashed','bus is down','brcmf_proto_bcdc_msg failed','BRCMF_C_GET_ASSOCLIST failed'))
+
+
+def decision(previous,observed,now,boot):
+    state=dict(previous)
+    if state.get('boot')!=boot:state=dict(boot=boot,failures=0,attempts=[])
+    state.update(observed=observed,checked=now)
+    state['attempts']=[stamp for stamp in state.get('attempts',[]) if now-stamp<3600]
+    state['failures']=state.get('failures',0)+1 if observed in ('unresponsive','firmware-failed') else 0
+    allowed=state['failures']>=3 and now-state.get('last_attempt',0)>=300 and len(state['attempts'])<3
+    return state,allowed
+
+
+def activate():
+    deadline=time.monotonic()+15
+    while not P.Path('/sys/class/net/wlan0').exists() and time.monotonic()<deadline:time.sleep(.5)
+    call('nmcli','--wait','20','con','up','E-DEV-AP','ifname','wlan0',timeout=25)
+    deadline=time.monotonic()+12
+    while time.monotonic()<deadline:
+        bridge=read(BASE/'wifi.json',{}).get('interface')=='edevbr0'
+        port=P.Path('/sys/class/net/wlan0/brport/state')
+        forwarding=not bridge or port.exists() and port.read_text().strip()=='3'
+        if radio_state()=='healthy' and forwarding:return True
+        time.sleep(1)
+    return False
+
+
+def reconnect():
+    # Do not touch the OUT bridge, DHCP leases, Ethernet, or the VPN process.
+    if other_broadcom_inputs():return False
+    call('nmcli','--wait','10','con','down','E-DEV-AP',timeout=12)
+    # Newer kernels load a vendor submodule that holds the core module.
+    try:
+        holders=sorted(p.name for p in P.Path('/sys/module/brcmfmac/holders').iterdir()
+                       if p.name in ('brcmfmac_cyw','brcmfmac_wcc','brcmfmac_bca'))
+    except OSError:holders=[]
+    if call('modprobe','-r',*holders,'brcmfmac',timeout=10).returncode==0:
+        call('modprobe','brcmfmac',timeout=12)
+    else:
+        print('Wi-Fi driver could not be unloaded; reconnecting the AP profile.',flush=True)
+    # Even an unsuccessful unload must not leave the AP deliberately down.
+    return activate()
+
+
+def health():
+    if not supported() or not (BASE/'mode').exists():return
+    with open('/run/e-dev-wifi.lock','a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return
+        observed=radio_state()
+        if observed=='inactive' and recent_firmware_failure():observed='firmware-failed'
+        boot=P.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        state,recover=decision(read(STATE,{}),observed,time.time(),boot)
+        if recover and not other_broadcom_inputs():
+            # Save the original failure before attempting a bounded recovery.
+            call('/usr/local/sbin/e-dev-diagnostics','snapshot-radio',timeout=18)
+            now=time.time();state['last_attempt']=now;state['attempts'].append(now);save(state)
+            print('Built-in Wi-Fi is repeatedly unresponsive; recovering AP driver.',flush=True)
+            ok=reconnect();state.update(last_result='recovered' if ok else 'failed',failures=0)
+            print('AP radio recovery: '+state['last_result'],flush=True)
+        save(state)
+
+
+def firmware():
+    if not supported():raise ValueError('Настройка рассчитана на встроенный Wi-Fi Pi 5.')
+    if not P.Path(MINIMAL).is_file():raise ValueError('Нужна штатная AP-прошивка из firmware-brcm80211.')
+    old=call('update-alternatives','--query','cyfmac43455-sdio.bin')
+    if old.returncode:raise ValueError('Не найдены штатные alternatives Wi-Fi прошивки.')
+    directory=P.Path('/opt/e-dev/backups')/('radio-firmware-'+str(time.time_ns()))
+    directory.mkdir(parents=True,mode=0o700);(directory/'alternatives.txt').write_text(old.stdout)
+    result=call('update-alternatives','--set','cyfmac43455-sdio.bin',MINIMAL)
+    if result.returncode:raise ValueError('Не удалось выбрать AP-прошивку.')
+    print('Выбрана штатная minimal AP-прошивка. Применится после перезагрузки радио. Копия: '+str(directory))
+
+
+if __name__=='__main__':
+    try:
+        if os.geteuid()!=0:raise ValueError('Требуется sudo.')
+        if sys.argv[1:]==['health']:health()
+        elif sys.argv[1:]==['firmware']:firmware()
+        elif sys.argv[1:]==['reconnect']:
+            if not supported() or other_broadcom_inputs():raise ValueError('Перезапуск драйвера IN не разрешён.')
+            with open('/run/e-dev-wifi.lock','a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                if not reconnect():raise ValueError('Радио не восстановилось; проверьте журнал.')
+        else:raise ValueError('Внутренняя команда: health / firmware / reconnect.')
+    except (OSError,ValueError,S.SubprocessError) as error:
+        print(str(error),file=sys.stderr);sys.exit(1)

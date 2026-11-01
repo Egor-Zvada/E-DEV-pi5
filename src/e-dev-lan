@@ -220,22 +220,39 @@ def delete_rules(priority):
 
 def routing(plan, devices):
     links = {key:connected(entry,devices) for key,entry in plan['inputs'].items()}
-    # Rebuild only E-DEV's rule range. Standby defaults stay in their own tables.
-    for row in json.loads(output('ip','-j','rule')):
-        if 10000<=row.get('priority',0)<10200:
-            delete_rules(row['priority'])
-    for row in json.loads(output('ip','-j','-4','route','show','table','main')):
-        if str(row.get('protocol'))==PROTO and row.get('dst')!='default':
-            call('ip','route','del',row['dst'],'dev',row['dev'],'metric',str(row['metric']),check=False)
+    # Health runs every 30 s: leave unchanged routes and rules in place.
+    # Add replacements first, then remove only obsolete entries we own.
+    wanted_routes=set();wanted_rules=set()
     for key, link in links.items():
         if not link:
             continue
         offset = link['table']-5000
         address = I.IPv4Interface(link['address'])
-        call('ip','route','replace',str(address.network),'dev',link['ifname'],'src',str(address.ip),
-             'metric',str(500+offset),'proto',PROTO)
-        call('ip','rule','add','priority',str(10000+offset),'oif',link['ifname'],'lookup',str(link['table']))
-        call('ip','rule','add','priority',str(10100+offset),'from',str(address.ip)+'/32','lookup',str(link['table']))
+        wanted_routes.add((str(address.network),link['ifname'],str(address.ip),500+offset))
+        wanted_rules.add((10000+offset,'oif',link['ifname'],str(link['table'])))
+        wanted_rules.add((10100+offset,'from',str(address.ip)+'/32',str(link['table'])))
+    current_routes={(row['dst'],row['dev'],row.get('prefsrc',''),row.get('metric',0))
+                    for row in json.loads(output('ip','-j','-4','route','show','table','main'))
+                    if str(row.get('protocol'))==PROTO and row.get('dst','default')!='default' and row.get('dev')}
+    current_rules=[]
+    for row in json.loads(output('ip','-j','rule')):
+        if not 10000<=row.get('priority',0)<10200:continue
+        kind='oif' if row.get('oif') else 'from'
+        value=row['oif'] if kind=='oif' else str(I.IPv4Network('0.0.0.0/0' if row.get('src','all')=='all' else row['src'],strict=False))
+        current_rules.append((row['priority'],kind,value,str(row.get('table',''))))
+    for dst,dev,src,metric in sorted(wanted_routes-current_routes):
+        call('ip','route','replace',dst,'dev',dev,'src',src,'metric',str(metric),'proto',PROTO)
+    for priority,kind,value,table in sorted(wanted_rules-set(current_rules)):
+        call('ip','rule','add','priority',str(priority),kind,value,'lookup',table)
+    for dst,dev,src,metric in sorted(current_routes-wanted_routes):
+        # A replace may already have replaced an entry with the same route key.
+        if any(dst==a and metric==d for a,b,c,d in wanted_routes):continue
+        call('ip','route','del',dst,'dev',dev,'metric',str(metric),'proto',PROTO,check=False)
+    seen=set()
+    for rule in current_rules:
+        if rule in wanted_rules and rule not in seen:seen.add(rule);continue
+        priority,kind,value,table=rule
+        call('ip','rule','del','priority',str(priority),kind,value,'lookup',table,check=False)
     return links
 
 

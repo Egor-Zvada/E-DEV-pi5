@@ -13,6 +13,23 @@ loader.exec_module(r)
 
 
 class RoutingTests(unittest.TestCase):
+    def test_tunnel_failure_keeps_home_lan_open_without_an_internet_exit(self):
+        with patch.object(r,'local_routes',return_value=[('10.42.0.0/24','wlan0'),('192.168.100.0/24','eth0')]):
+            blocked=r.rules('blocked')
+        self.assertIn('192.168.100.0/24',blocked)
+        self.assertIn('ip daddr { 10.42.0.0/24, 192.168.100.0/24 } accept',blocked)
+        self.assertNotIn('oifname "awg0" accept',blocked)
+        self.assertIn('counter drop',blocked)
+
+    def test_vpn_route_refresh_preserves_unchanged_lan_route(self):
+        previous=[dict(dst='192.168.100.0/24',dev='eth0'),dict(dst='10.42.0.0/24',dev='wlan0')]
+        def call(*args,**kw):
+            return types.SimpleNamespace(stdout=json.dumps(previous) if args[:4]==('ip','-j','-4','route') else '[]',returncode=1 if args[:3]==('ip','rule','del') else 0)
+        with patch.object(r,'local_routes',return_value=[('192.168.100.0/24','eth0'),('10.42.0.0/24','wlan0')]),patch.object(r,'call',side_effect=call) as commands:
+            r.routes('hybrid')
+        changed=[c.args for c in commands.call_args_list if c.args[:3] in (('ip','route','del'),('ip','route','replace'))]
+        self.assertFalse(any('192.168.100.0/24' in c or '10.42.0.0/24' in c for c in changed))
+
     def test_lan_follows_physical_uplink_and_excludes_tunnel_routes(self):
         rows = [{'dev':'eth0', 'dst':'192.168.55.0/24', 'scope':'link', 'protocol':'kernel'},
                 {'dev':'wlan1', 'dst':'172.16.5.0/24', 'scope':'link', 'protocol':'kernel'},

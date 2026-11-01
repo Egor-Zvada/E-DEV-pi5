@@ -46,6 +46,23 @@ if __name__=='__main__':
         assert 'dev wan1' in ip('route','get','1.1.1.1').stdout
         lan.set_default(None)
         assert ip('route','get','1.1.1.1',check=False).returncode!=0
-        print('Kernel routes: primary, bound standby, source replies, switch and blocked fallback OK.')
+        links={str(n):dict(ifname='wan'+str(n),address='192.168.'+str(70+n)+'.2/24',gateway='192.168.'+str(70+n)+'.1',table=5000+n) for n in (0,1)}
+        lan.connected=lambda entry,devices:entry
+        plan=dict(inputs=links)
+        lan.routing(plan,[])
+        mutations=[]
+        def observed(*args,check=True,**kw):
+            if len(args)>2 and args[1] in ('rule','route') and args[2] in ('add','del','replace'):mutations.append(args)
+            return ip(*args[1:],check=check)
+        lan.call=observed
+        lan.routing(plan,[])
+        assert not mutations, mutations
+        ip('addr','add','192.168.70.3/24','dev','wan0')
+        links['0']['address']='192.168.70.3/24'
+        lan.routing(plan,[])
+        rules=ip('-4','rule').stdout
+        assert 'from 192.168.70.3 lookup 5000' in rules
+        assert 'from 192.168.70.2 lookup 5000' not in rules
+        print('Kernel routes: primary/standby, blocked fallback, unchanged-health no-op and address replacement OK.')
     finally:
         call('ip','netns','delete',namespace)

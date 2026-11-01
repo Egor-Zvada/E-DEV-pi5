@@ -5,7 +5,7 @@ REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID == 0 ]] || { echo 'Требуется root' >&2; exit 1; }
 python3 "$REPO_DIR/scripts/build_wiki.py"
 install -m 755 "$REPO_DIR/src/e-dev" /usr/local/bin/e-dev
-for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui e-dev-tui e-dev-actions e-dev-settings e-dev-diagnostics e-dev-incus-ready; do
+for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui e-dev-tui e-dev-actions e-dev-settings e-dev-diagnostics e-dev-incus-ready e-dev-radio; do
     install -m 755 "$REPO_DIR/src/$component" "/usr/local/sbin/$component"
 done
 for alias_name in E-DEV E-dev edev; do ln -sfn /usr/local/bin/e-dev "/usr/local/bin/$alias_name"; done
@@ -36,4 +36,5 @@ journalctl --flush
 if [[ -f /etc/e-dev/mode ]]; then
     systemctl enable e-dev-diagnostics.service
     systemctl restart e-dev-diagnostics.service
+    systemctl enable --now e-dev-radio-health.timer
 fi

@@ -34,7 +34,10 @@ def local_routes():
 def rules(mode):
  ap=ap_interface();subnet=str(ap.network)
  nets='{ 10.43.0.0/24, '+subnet+' }' if mode!='direct' else '10.43.0.0/24'
- allowed='ip daddr { '+', '.join(sorted(set(net for net,dev in local_routes())))+' } accept\n  oifname "awg0" accept' if mode!='blocked' else ''
+ # Local devices stay reachable even while the tunnel starts or fails. The
+ # fail-closed guard protects Internet traffic, not the directly attached LAN.
+ allowed='ip daddr { '+', '.join(sorted(set(net for net,dev in local_routes())))+' } accept'
+ if mode!='blocked': allowed+='\n  oifname "awg0" accept'
  if mode=='hybrid': allowed='ip saddr '+subnet+' meta mark 0x42 accept\n  '+allowed
  dns=str(ap.ip)+':1053' if mode!='blocked' else '1.1.1.1'
  return '''table inet e_dev_guard {
@@ -103,14 +106,16 @@ def routes(mode):
  call('ip','rule','add','priority','10422','oif','awg0','lookup','1042')
  if mode=='hybrid': call('ip','rule','add','priority','10419','from',str(ap_interface().network),'fwmark','0x42','lookup','main')
  call('ip','route','replace','blackhole','default','metric','32760','table','1042')
- # Keep both default routes in place while removing stale connected LAN routes.
+ # Preserve unchanged local routes during VPN changes too.
+ wanted=set(local_routes())
  try:
   previous=json.loads(call('ip','-j','-4','route','show','table','1042',check=False).stdout or '[]')
-  for row in previous:
-   if row.get('dst') not in (None,'default'): call('ip','route','del',row['dst'],'table','1042',check=False)
- except ValueError: pass
- for net,dev in local_routes():
+  existing={(row['dst'],row.get('dev','')) for row in previous if row.get('dst') not in (None,'default')}
+ except ValueError: existing=set()
+ for net,dev in sorted(wanted-existing):
   call('ip','route','replace',net,'dev',dev,'table','1042',check=False)
+ for net,dev in sorted(existing-wanted):
+  if not any(net==dst for dst,_ in wanted):call('ip','route','del',net,'table','1042',check=False)
  for priority,net in [('10420',str(ap_interface().network)),('10421','10.43.0.0/24')]:
   while call('ip','rule','del','priority',priority,check=False).returncode==0: pass
   if net=='10.43.0.0/24' or mode!='direct': call('ip','rule','add','priority',priority,'from',net,'lookup','1042')
@@ -136,6 +141,7 @@ def main():
  with open('/run/e-dev-vpn.lock','w') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX)
   command=sys.argv[1] if len(sys.argv)>1 else 'boot'
+  if command=='refresh' and not (B/'mode').exists():return
   mode=readmode();name=(B/'selected-profile').read_text().strip()
   if command in ('on','off','hybrid'):
    mode={'on':'vpn','off':'direct','hybrid':'hybrid'}[command]
@@ -159,6 +165,7 @@ def main():
    call('systemctl','--no-block','try-restart','e-dev-dns.service',check=False)
    if command in ('start','boot') and (B/'vpn-policy.json').exists() and json.loads((B/'vpn-policy.json').read_text()).get('mode')=='auto' and enabled():
     call('systemctl','--no-block','start','e-dev-auto.service',check=False)
+  elif command=='refresh': routes(mode);guard(mode)
   elif command=='geo-load': split(mode);geo_load()
   else: raise ValueError('Unknown operation')
   print('AP: '+mode+'; VPN: '+('on' if enabled() else 'off')+'; профиль: '+name)

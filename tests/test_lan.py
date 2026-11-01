@@ -26,6 +26,27 @@ def plan():
 
 
 class LanTests(unittest.TestCase):
+    def test_unchanged_health_check_does_not_delete_or_recreate_input_routes(self):
+        route=dict(dst='192.168.55.0/24',dev='eth0',prefsrc='192.168.55.2',metric=500,protocol=241)
+        rules=[dict(priority=10000,src='all',oif='eth0',table=5000),dict(priority=10100,src='192.168.55.2',table=5000)]
+        link=dict(ifname='eth0',address='192.168.55.2/24',gateway='192.168.55.1',table=5000)
+        with patch.object(l,'connected',side_effect=lambda e,d:link if e['id']=='eth0' else None),patch.object(l,'output',side_effect=lambda *a:json.dumps(rules if a[-1]=='rule' else [route])),patch.object(l,'call') as call:
+            self.assertEqual(l.routing(plan(),[])['eth0'],link)
+            call.assert_not_called()
+
+    def test_input_address_change_adds_new_source_rule_before_removing_old_one(self):
+        route=dict(dst='192.168.55.0/24',dev='eth0',prefsrc='192.168.55.2',metric=500,protocol=241)
+        rules=[dict(priority=10000,src='all',oif='eth0',table=5000),dict(priority=10100,src='192.168.55.2',table=5000),dict(priority=9000,src='all',table=9000)]
+        link=dict(ifname='eth0',address='192.168.55.3/24',gateway='192.168.55.1',table=5000)
+        with patch.object(l,'connected',side_effect=lambda e,d:link if e['id']=='eth0' else None),patch.object(l,'output',side_effect=lambda *a:json.dumps(rules if a[-1]=='rule' else [route])),patch.object(l,'call') as call:
+            l.routing(plan(),[])
+        commands=[c.args for c in call.call_args_list]
+        add=('ip','rule','add','priority','10100','from','192.168.55.3/32','lookup','5000')
+        delete=('ip','rule','del','priority','10100','from','192.168.55.2/32','lookup','5000')
+        self.assertLess(commands.index(add),commands.index(delete))
+        self.assertFalse(any('9000' in c for c in commands))
+        self.assertFalse(any(c[:3]==('ip','route','del') for c in commands))
+
     def test_builtin_interfaces_and_zones_are_immutable(self):
         p=plan()
         self.assertEqual(l.validate(p),p)

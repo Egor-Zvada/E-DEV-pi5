@@ -1,0 +1,11 @@
+[Unit]
+Description=Check E-DEV AP firmware responsiveness
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=2s
+Unit=e-dev-radio-health.service
+
+[Install]
+WantedBy=timers.target

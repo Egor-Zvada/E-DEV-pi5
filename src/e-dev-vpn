@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """E-DEV routing and tunnel lifecycle: independent controls, fail closed."""
-import pathlib as P, subprocess as S, sys, re, fcntl, ipaddress, json, os
+import pathlib as P, subprocess as S, sys, re, fcntl, ipaddress, json, os, time
 B=P.Path('/etc/e-dev')
+DNS_ROTATION_SECONDS=3600
+DNS_SETS=('ru4','vpn4')
 def call(*a,check=True,input=None):
  env=dict(os.environ,WG_QUICK_USERSPACE_IMPLEMENTATION='/usr/local/sbin/e-dev-awg-launch') if a[0]=='awg-quick' else None
  return S.run(a,input=input,text=True,stdout=S.PIPE,stderr=S.PIPE,check=check,env=env)
@@ -77,31 +79,88 @@ def custom_load():
  batch='flush set inet e_dev_split custom4\n'
  if nets: batch+='add element inet e_dev_split custom4 { '+', '.join(nets)+' }\n'
  call('nft','-f','-',input=batch)
+
+def dns_set(name):
+ result=call('nft','-j','list','set','inet','e_dev_split',name,check=False)
+ if result.returncode:return None
+ return next(row['set'] for row in json.loads(result.stdout)['nftables'] if 'set' in row)
+
+def dns_set_values(data):
+ values=[]
+ for item in data.get('elem',[]):
+  value=item['elem']['val'] if isinstance(item,dict) else item
+  values.append(str(ipaddress.IPv4Address(value)))
+ return sorted(set(values))
+
+def dns_elements(name,values):
+ return 'add element inet e_dev_split '+name+' { '+', '.join(values)+' }\n' if values else ''
+
+def dns_rotation_state(now=None,boot=None):
+ now=time.monotonic() if now is None else now
+ boot=P.Path('/proc/sys/kernel/random/boot_id').read_text().strip() if boot is None else boot
+ try:
+  state=json.loads((B/'dns-rotation.json').read_text())
+  if state['boot']==boot and 0<=state['time']<=now:return state
+ except (OSError,ValueError,KeyError,TypeError):pass
+ state=dict(boot=boot,time=now);save('dns-rotation.json',json.dumps(state));return state
+
+def rotate_dns_sets(now=None,boot=None):
+ now=time.monotonic() if now is None else now
+ state=dns_rotation_state(now,boot)
+ if now-state['time']<DNS_ROTATION_SECONDS:return False
+ # Keep the preceding generation longer than the entire DNS cache/client
+ # lifetime. dnsmasq does not refresh an existing nft element's timeout.
+ # The transaction retains all current addresses without a routing gap.
+ batch='';counts={}
+ for name in DNS_SETS:
+  data=dns_set(name)
+  if data is None or dns_set(name+'_prev') is None:raise ValueError('DNS routing sets are not initialized.')
+  values=dns_set_values(data);counts[name]=len(values)
+  batch+='flush set inet e_dev_split '+name+'_prev\n'+dns_elements(name+'_prev',values)
+  # Delete only the snapshot members: DNS can add a new address between our
+  # read and the transaction. Flushing the current set would lose that reply.
+  if values:batch+='delete element inet e_dev_split '+name+' { '+', '.join(values)+' }\n'
+ # Save first: if storage or the kernel transaction fails, retaining an old
+ # generation longer is safer than retrying a successful rotation too early.
+ state['time']=now;save('dns-rotation.json',json.dumps(state))
+ call('nft','-f','-',input=batch)
+ print('DNS routing generation rotated: '+json.dumps(counts));return True
+
 def split(mode):
  exists=call('nft','list','table','inet','e_dev_split',check=False).returncode==0
  if not exists:
-  call('nft','-f','-',input='add table inet e_dev_split\nadd set inet e_dev_split ru4 { type ipv4_addr; flags timeout; timeout 1h; }\nadd chain inet e_dev_split classify { type filter hook prerouting priority mangle; policy accept; }\n')
+  call('nft','-f','-',input='add table inet e_dev_split\nadd chain inet e_dev_split classify { type filter hook prerouting priority mangle; policy accept; }\n')
  if call('nft','list','set','inet','e_dev_split','rusubnets',check=False).returncode:
   call('nft','-f','-',input='add set inet e_dev_split rusubnets { type ipv4_addr; flags interval; auto-merge; }\n')
   geo_load()
  if call('nft','list','set','inet','e_dev_split','custom4',check=False).returncode:
   call('nft','-f','-',input='add set inet e_dev_split custom4 { type ipv4_addr; flags interval; auto-merge; }\n')
- if call('nft','list','set','inet','e_dev_split','vpn4',check=False).returncode:
-  call('nft','-f','-',input='add set inet e_dev_split vpn4 { type ipv4_addr; flags timeout; timeout 1h; }\n')
  custom_load()
  batch='flush chain inet e_dev_split classify\n'
+ for name in DNS_SETS:
+  data=dns_set(name)
+  if data and 'timeout' in data.get('flags',[]):
+   batch+='delete set inet e_dev_split '+name+'\n'
+  if data is None or 'timeout' in data.get('flags',[]):
+   batch+='add set inet e_dev_split '+name+' { type ipv4_addr; }\n'
+   if data:batch+=dns_elements(name,dns_set_values(data))
+  if dns_set(name+'_prev') is None:batch+='add set inet e_dev_split '+name+'_prev { type ipv4_addr; }\n'
  if mode=='hybrid':
   prefix='add rule inet e_dev_split classify ip saddr '+str(ap_interface().network)
   local='{ '+', '.join(sorted(set(net for net,dev in local_routes())))+' }'
   batch+=prefix+' ip daddr '+local+' meta mark set 0 ct mark set 0 return\n'
+  # Keep established sessions on their original exit across DNS generations.
+  batch+=prefix+' ct state established,related ct mark 0x42 meta mark set 0x42 return\n'
+  batch+=prefix+' ct state established,related ct mark 0x43 meta mark set 0 return\n'
   # Explicit direct rules win over VPN-domain exceptions; VPN-domain exceptions
   # win over GeoIP. A foreign service may use a server with a Russian IP.
-  for name in ('custom4','ru4'):
+  for name in ('custom4','ru4','ru4_prev'):
    batch+=prefix+' ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter return\n'
-  batch+=prefix+' ip daddr @vpn4 meta mark set 0 ct mark set 0 counter return\n'
+  for name in ('vpn4','vpn4_prev'):
+   batch+=prefix+' ip daddr @'+name+' meta mark set 0 ct mark set 0x43 counter return\n'
   if hybrid_cfg()['geo']:
    batch+=prefix+' ip daddr @rusubnets meta mark set 0x42 ct mark set 0x42 counter return\n'
-  batch+=prefix+' ct mark 0x42 meta mark set 0x42\n'
+  batch+=prefix+' meta mark set 0 ct mark set 0x43\n'
  call('nft','-f','-',input=batch)
 def guard(mode):
  split(mode)
@@ -153,6 +212,9 @@ def main():
   command=sys.argv[1] if len(sys.argv)>1 else 'boot'
   if command=='refresh' and not (B/'mode').exists():return
   mode=readmode();name=(B/'selected-profile').read_text().strip()
+  if command=='dns-rotate':rotate_dns_sets();return
+  try:dns_rotation_state()
+  except OSError:print('DNS generation clock could not be saved; VPN recovery continues.',file=sys.stderr)
   if command in ('on','off','hybrid'):
    mode={'on':'vpn','off':'direct','hybrid':'hybrid'}[command]
    guard('blocked' if mode!='direct' else 'direct');routes(mode);guard(mode);save('mode',mode)

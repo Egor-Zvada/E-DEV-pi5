@@ -201,12 +201,12 @@ def route_check(host):
             print(host+' → '+addr+' → локальная сеть · '+device+' (подключённая подсеть)')
             continue
         settings=BASE/'hybrid.json';geo=json.loads(settings.read_text()).get('geo',True) if settings.exists() else True
-        ru=geo and set_contains('rusubnets',addr);domain=set_contains('ru4',addr);custom=set_contains('custom4',addr)
-        forced=set_contains('vpn4',addr)
+        ru=geo and set_contains('rusubnets',addr);domain=set_contains('ru4',addr) or set_contains('ru4_prev',addr);custom=set_contains('custom4',addr)
+        forced=set_contains('vpn4',addr) or set_contains('vpn4_prev',addr)
         direct=current_mode=='direct' or (current_mode=='hybrid' and (domain or custom or ru and not forced))
         reason='VPN OFF' if current_mode=='direct' else 'VPN ON' if current_mode!='hybrid' else 'свой IP/сеть' if custom else 'доменное исключение' if domain else 'VPN-домен поверх GeoIP' if forced else 'RU IP-база' if ru else 'общий маршрут'
         print(host+' → '+addr+' → '+('провайдер' if direct else 'VPN')+' ('+reason+')')
-    print('Это проверка выбора маршрута AP, не проверка открытия приложения.')
+    print('Это выбор маршрута AP для нового соединения, не проверка открытия приложения.')
 
 def password(service):
     if service not in ('all','ssh','files','wifi','ui'): fail('Выберите all, ssh, files, wifi или ui.')

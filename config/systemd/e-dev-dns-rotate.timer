@@ -1,0 +1,11 @@
+[Unit]
+Description=Age E-DEV DNS routing addresses without expiring active sessions
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=e-dev-dns-rotate.service
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import pathlib as P
+import runpy
 import subprocess as S
 import tempfile
 import unittest
@@ -11,12 +12,13 @@ d=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,lo
 
 
 class DNSConfigTests(unittest.TestCase):
-    def test_cache_and_client_ttl_expire_before_domain_routing_sets(self):
+    def test_cache_and_client_ttl_fit_within_one_routing_generation(self):
         text=(P.Path(__file__).resolve().parents[1]/'config/e-dev-dns-resilience.conf').read_text()
         values=dict(line.split('=',1) for line in text.splitlines() if line and not line.startswith('#'))
         stale=int(values['use-stale-cache'])
-        self.assertLess(int(values['max-cache-ttl'])+stale,3600)
-        self.assertLess(int(values['max-ttl'])+stale,3600)
+        period=runpy.run_path(str(P.Path(__file__).resolve().parents[1]/'src/e-dev-vpn'))['DNS_ROTATION_SECONDS']
+        self.assertLess(int(values['max-cache-ttl'])+stale,period)
+        self.assertLess(int(values['max-ttl'])+stale,period)
 
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.base=P.Path(self.tmp.name)

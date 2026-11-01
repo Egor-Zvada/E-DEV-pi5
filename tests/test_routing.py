@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import pathlib
+import subprocess
 import json
 import types
 import unittest
@@ -20,8 +21,40 @@ class RoutingTests(unittest.TestCase):
         self.assertLess(batch.index('@custom4'),batch.index('@ru4'))
         self.assertLess(batch.index('@ru4'),batch.index('@vpn4'))
         self.assertLess(batch.index('@vpn4'),batch.index('@rusubnets'))
-        self.assertIn('@vpn4 meta mark set 0 ct mark set 0 counter return',batch)
+        self.assertIn('@vpn4 meta mark set 0 ct mark set 0x43 counter return',batch)
+        self.assertIn('@vpn4_prev',batch)
+        self.assertIn('ct state established,related ct mark 0x43 meta mark set 0 return',batch)
         self.assertIn('meta mark set 0 ct mark set 0 return',batch)
+
+    def test_dns_rotation_keeps_previous_generation_and_is_never_early(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(r,'B',pathlib.Path(folder)),patch.object(r,'call') as call:
+            r.dns_rotation_state(100,'test-boot')
+            self.assertFalse(r.rotate_dns_sets(200,'test-boot'));call.assert_not_called()
+            def values(name):return {'elem':['203.0.113.9']} if name=='vpn4' else {'elem':[]}
+            with patch.object(r,'dns_set',side_effect=values):
+                self.assertTrue(r.rotate_dns_sets(100+r.DNS_ROTATION_SECONDS,'test-boot'))
+            batch=call.call_args.kwargs['input']
+            self.assertIn('add element inet e_dev_split vpn4_prev { 203.0.113.9 }',batch)
+            self.assertIn('delete element inet e_dev_split vpn4 { 203.0.113.9 }',batch)
+            self.assertNotIn('flush set inet e_dev_split vpn4\n',batch)
+            self.assertNotIn('systemctl',str(call.call_args_list))
+            call.reset_mock()
+            self.assertFalse(r.rotate_dns_sets(101+r.DNS_ROTATION_SECONDS,'test-boot'));call.assert_not_called()
+            self.assertFalse(r.rotate_dns_sets(200+r.DNS_ROTATION_SECONDS,'new-boot'));call.assert_not_called()
+
+    def test_bad_dns_rotation_data_never_flushes_current_sets(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(r,'B',pathlib.Path(folder)),patch.object(r,'call') as call:
+            r.dns_rotation_state(0,'test-boot')
+            with patch.object(r,'dns_set',return_value={'elem':['not-an-address']}):
+                with self.assertRaises(ValueError):r.rotate_dns_sets(r.DNS_ROTATION_SECONDS,'test-boot')
+            call.assert_not_called()
+
+    def test_failed_kernel_rotation_cannot_retry_before_cache_grace_expires(self):
+        with tempfile.TemporaryDirectory() as folder,patch.object(r,'B',pathlib.Path(folder)),patch.object(r,'dns_set',return_value={'elem':[]}),patch.object(r,'call',side_effect=subprocess.CalledProcessError(1,['nft'])) as call:
+            r.dns_rotation_state(0,'test-boot')
+            with self.assertRaises(subprocess.CalledProcessError):r.rotate_dns_sets(r.DNS_ROTATION_SECONDS,'test-boot')
+            call.reset_mock()
+            self.assertFalse(r.rotate_dns_sets(r.DNS_ROTATION_SECONDS+1,'test-boot'));call.assert_not_called()
 
     def test_tunnel_failure_keeps_home_lan_open_without_an_internet_exit(self):
         with patch.object(r,'local_routes',return_value=[('10.42.0.0/24','wlan0'),('192.168.100.0/24','eth0')]):

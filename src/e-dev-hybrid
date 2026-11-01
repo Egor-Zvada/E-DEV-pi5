@@ -18,7 +18,7 @@ def dns_reload():
  with open('/run/e-dev-vpn.lock','w') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX)
   runtime=runpy.run_path('/usr/local/sbin/e-dev-vpn');runtime['guard'](runtime['readmode']())
-  for name in ('ru4','vpn4'):run('nft','flush','set','inet','e_dev_split',name)
+  for name in ('ru4','vpn4','ru4_prev','vpn4_prev'):run('nft','flush','set','inet','e_dev_split',name)
   run('systemctl','restart','e-dev-dns')
 
 def apply():

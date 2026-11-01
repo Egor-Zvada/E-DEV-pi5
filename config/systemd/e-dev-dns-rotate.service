@@ -1,0 +1,9 @@
+[Unit]
+Description=E-DEV bounded DNS routing generations
+After=e-dev-vpn.service
+ConditionPathExists=/etc/e-dev/mode
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e-dev-vpn dns-rotate
+TimeoutStartSec=30

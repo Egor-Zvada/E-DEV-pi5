@@ -22,7 +22,7 @@ def run(*args,check=True,input=None):
 if __name__=='__main__':
     if os.geteuid()!=0:raise SystemExit('Run with sudo on Linux.')
     router,client,server=['edev-'+name+'-'+str(os.getpid()) for name in ('rt','cl','sv')]
-    made=[];process=None;vpn_process=None
+    made=[];process=None;vpn_process=None;persistent_client=None
     def inside(ns,*args,**kw):return run('ip','netns','exec',ns,*args,**kw)
     def ip(ns,*args,**kw):return inside(ns,'ip',*args,**kw)
     try:
@@ -66,8 +66,20 @@ if __name__=='__main__':
                 ip(ns,'addr','add',addr,'dev',dev);ip(ns,'link','set',dev,'up')
             ip(vpn_server,'addr','add','1.1.1.1/32','dev','lo');ip(vpn_server,'route','add','default','via','192.0.2.1')
             vpn_dir=v.B/'vpn-server';vpn_dir.mkdir();(vpn_dir/'index.html').write_text('vpn-route-ok\n')
-            vpn_process=S.Popen(['ip','netns','exec',vpn_server,'python3','-m','http.server','18087','--bind','0.0.0.0','--directory',str(vpn_dir)],stdout=S.DEVNULL,stderr=S.DEVNULL)
+            server_code="""from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+class Handler(BaseHTTPRequestHandler):
+ protocol_version='HTTP/1.1'
+ def do_GET(self):
+  body=b'vpn-route-ok\\n';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+ def log_message(self,*args):pass
+ThreadingHTTPServer(('0.0.0.0',18087),Handler).serve_forever()
+"""
+            vpn_process=S.Popen(['ip','netns','exec',vpn_server,'python3','-c',server_code],stdin=S.DEVNULL,stdout=S.DEVNULL,stderr=S.DEVNULL)
+            # Upgrade an existing timeout-based set while retaining its members.
+            inside(router,'nft','-f','-',input='add table inet e_dev_split\nadd set inet e_dev_split ru4 { type ipv4_addr; flags timeout; timeout 1h; }\nadd element inet e_dev_split ru4 { 203.0.113.17 }\nadd chain inet e_dev_split classify { type filter hook prerouting priority mangle; policy accept; }\nadd rule inet e_dev_split classify ip daddr @ru4 return\n')
             v.routes('hybrid');v.split('hybrid')
+            assert 'timeout' not in v.dns_set('ru4').get('flags',[])
+            assert '203.0.113.17' in v.dns_set_values(v.dns_set('ru4'))
             ip(router,'route','replace','default','via','192.0.2.2','dev','awg0','metric','10','table','1042')
             inside(router,'nft','-f','-',input='delete table inet e_dev_guard\n'+v.rules('hybrid'))
             inside(router,'nft','add','element','inet','e_dev_split','rusubnets','{','1.1.1.0/24','}')
@@ -84,12 +96,38 @@ if __name__=='__main__':
                 inside(router,'nft','flush','set','inet','e_dev_split',group)
             inside(router,'nft','add','element','inet','e_dev_split','vpn4','{','192.168.100.2','}')
             assert get('192.168.100.2').stdout=='local-route-ok\n','Local LAN must always stay local.'
+            client_code="""import http.client,sys
+connection=http.client.HTTPConnection('1.1.1.1',18087,timeout=3)
+for line in sys.stdin:
+ connection.request('GET','/');reply=connection.getresponse();print(reply.read().decode().strip(),flush=True)
+"""
+            persistent_client=S.Popen(['ip','netns','exec',client,'python3','-u','-c',client_code],stdin=S.PIPE,stdout=S.PIPE,stderr=S.PIPE,text=True)
+            def established_request():
+                persistent_client.stdin.write('request\n');persistent_client.stdin.flush()
+                return persistent_client.stdout.readline().strip()
+            assert established_request()=='vpn-route-ok'
+            v.dns_rotation_state(0,'test-boot')
+            original_call=v.call
+            def concurrent_dns_reply(*args,**kwargs):
+                if args[:2]==('nft','-f') and 'flush set inet e_dev_split vpn4_prev' in kwargs.get('input',''):
+                    inside(router,'nft','add','element','inet','e_dev_split','vpn4','{','203.0.113.55','}')
+                return original_call(*args,**kwargs)
+            v.call=concurrent_dns_reply
+            try:assert v.rotate_dns_sets(v.DNS_ROTATION_SECONDS,'test-boot')
+            finally:v.call=original_call
+            assert '203.0.113.55' in v.dns_set_values(v.dns_set('vpn4')),'Concurrent DNS reply was lost during rotation.'
+            assert get('1.1.1.1').stdout=='vpn-route-ok\n','Previous generation must cover cached DNS clients.'
+            assert v.rotate_dns_sets(v.DNS_ROTATION_SECONDS*2,'test-boot')
+            assert '1.1.1.1' not in v.dns_set_values(v.dns_set('vpn4_prev')),'Expired generation was not collected.'
+            assert established_request()=='vpn-route-ok','Aging DNS must not reroute an established VPN session.'
+            assert get('1.1.1.1').stdout=='local-route-ok\n','A new flow must use current GeoIP after an old domain mapping expires.'
+            inside(router,'nft','add','element','inet','e_dev_split','vpn4','{','1.1.1.1','}')
             ip(router,'link','del','awg0')
             assert get('192.168.100.2').stdout=='local-route-ok\n'
             assert get('1.1.1.1').returncode!=0,'Tunnel loss must not turn a VPN exception into a provider fallback.'
-            print('Kernel packets: LAN survives VPN loss; no Internet leak; explicit rules > VPN domains > GeoIP verified.')
+            print('Kernel packets: LAN survives VPN loss; no Internet leak; routing priorities, timeout-set migration, DNS generations and established-session stability verified.')
     finally:
-        for child in (process,vpn_process):
+        for child in (persistent_client,process,vpn_process):
             if child:
                 child.terminate()
                 try:child.wait(timeout=2)

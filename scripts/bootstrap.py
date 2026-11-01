@@ -303,7 +303,7 @@ def main():
         time.sleep(1)
     else:
         raise ValueError('Применение LAN ещё не завершилось: journalctl -u e-dev-lan-apply')
-    run('systemctl','enable','--now','e-dev-network.service','e-dev-uplink.timer','e-dev-radio-health.timer')
+    run('systemctl','enable','--now','e-dev-network.service','e-dev-uplink.timer','e-dev-radio-health.timer','e-dev-dns-rotate.timer')
     run('systemctl','enable','--now','e-dev-diagnostics.service')
     if P.Path('/usr/lib/firmware/cypress/cyfmac43455-sdio-minimal.bin').exists():
         run('/usr/local/sbin/e-dev-radio','firmware')

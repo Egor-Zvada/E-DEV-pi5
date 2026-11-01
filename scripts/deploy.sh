@@ -40,5 +40,5 @@ journalctl --flush
 if [[ -f /etc/e-dev/mode ]]; then
     systemctl enable e-dev-diagnostics.service
     systemctl restart e-dev-diagnostics.service
-    systemctl enable --now e-dev-radio-health.timer
+    systemctl enable --now e-dev-radio-health.timer e-dev-dns-rotate.timer
 fi

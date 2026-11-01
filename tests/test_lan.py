@@ -26,6 +26,19 @@ def plan():
 
 
 class LanTests(unittest.TestCase):
+    def test_recreated_vpn_restarts_dns_sockets_without_restarting_ap(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(l,'B',pathlib.Path(temp)):
+            (l.B/'profiles').mkdir();(l.B/'profiles/main.conf').touch();(l.B/'selected-profile').write_text('main')
+            events=[]
+            runtime={'readmode':lambda:'hybrid','guard':lambda m:events.append(('guard',m)),
+                     'routes':lambda m:None,'enabled':lambda:True,'tunnel':lambda n:events.append(('tunnel',n))}
+            with patch.object(l.runpy,'run_path',return_value=runtime),patch.object(l,'call') as call:
+                l.runtime_refresh(reconnect=True)
+            call.assert_called_once_with('systemctl','--no-block','try-restart','e-dev-dns.service',check=False)
+            self.assertIn(('tunnel','main'),events)
+            with patch.object(l.runpy,'run_path',return_value=runtime),patch.object(l,'call') as call:
+                l.runtime_refresh(reconnect=False);call.assert_not_called()
+
     def test_unchanged_health_check_does_not_delete_or_recreate_input_routes(self):
         route=dict(dst='192.168.55.0/24',dev='eth0',prefsrc='192.168.55.2',metric=500,protocol=241)
         rules=[dict(priority=10000,src='all',oif='eth0',table=5000),dict(priority=10100,src='192.168.55.2',table=5000)]

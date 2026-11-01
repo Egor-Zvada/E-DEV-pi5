@@ -171,8 +171,7 @@ def initial_settings(args):
     for name, value in settings.items():
         if not (BASE/name).exists():
             write(BASE/name, value)
-    write(BASE/'dns.conf', 'port=1053\nlisten-address=10.42.0.1\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=1000\nserver=1.1.1.1@awg0\nserver=8.8.8.8@awg0\nnftset=/'+ '/'.join(DOMAINS)+'/4#inet#e_dev_split#ru4\n')
-    write('/etc/NetworkManager/dnsmasq-shared.d/e-dev-upstream.conf', 'no-resolv\nserver=1.1.1.1\nserver=8.8.8.8\n')
+    run('/usr/local/sbin/e-dev-dns-config')
     loader = importlib.machinery.SourceFileLoader('runtime', str(REPO/'src/e-dev-vpn'))
     runtime = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(runtime)

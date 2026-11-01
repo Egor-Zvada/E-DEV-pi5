@@ -14,6 +14,18 @@ loader.exec_module(c)
 
 
 class WifiTests(unittest.TestCase):
+    def test_route_check_keeps_local_lan_direct_even_with_vpn_domain_conflict(self):
+        with patch.object(c,'root'),patch.object(c,'mode',return_value='hybrid'),patch.object(c.runpy,'run_path',return_value={'local_routes':lambda:[('192.168.100.0/24','eth0')]}),patch.object(c,'set_contains',return_value=True),contextlib.redirect_stdout(io.StringIO()) as output:
+            c.route_check('192.168.100.52')
+        self.assertIn('локальная сеть · eth0',output.getvalue())
+        self.assertNotIn('→ VPN',output.getvalue())
+
+    def test_route_check_uses_direct_dns_when_tunnel_is_not_required(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(c,'BASE',pathlib.Path(tmp)),patch.object(c,'root'),patch.object(c,'mode',return_value='direct'),patch.object(c.runpy,'run_path',return_value={'local_routes':lambda:[]}),patch.object(c,'out',return_value='203.0.113.9') as out,patch.object(c,'set_contains',return_value=False),contextlib.redirect_stdout(io.StringIO()) as output:
+            c.route_check('example.test')
+        self.assertIn('53',out.call_args.args[0])
+        self.assertIn('провайдер (VPN OFF)',output.getvalue())
+
     def test_partial_legacy_system_settings_keep_default_user_and_explicit_values(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(c,'BASE',pathlib.Path(tmp)):
             system=pathlib.Path(tmp)/'system.json'

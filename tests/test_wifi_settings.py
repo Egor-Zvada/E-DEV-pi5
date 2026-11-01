@@ -15,6 +15,12 @@ loader.exec_module(w)
 
 
 class WifiSettingsTests(unittest.TestCase):
+    def test_width_validation_rejects_incompatible_band_or_auto_channel(self):
+        self.assertEqual(w.validate_radio(dict(ssid='AP',band='a',channel=36,width=80))['width'],80)
+        for values in (dict(band='bg',channel=11,width=80),dict(band='a',channel=0,width=80),dict(band='a',channel=36,width=160)):
+            with self.assertRaises(ValueError):w.validate_radio(dict(ssid='AP',**values))
+        self.assertIn('802-11-wireless.channel-width',w.RADIO_FIELDS)
+
     def candidate(self):
         return dict(address='192.168.50.1/24', dhcp_range='192.168.50.100,192.168.50.200', lease=3600)
 

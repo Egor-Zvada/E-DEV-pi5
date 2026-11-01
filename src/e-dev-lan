@@ -300,6 +300,9 @@ def runtime_refresh(reconnect=False):
     selected = (B/'selected-profile').read_text().strip()
     if reconnect and runtime['enabled']() and selected and (B/'profiles'/(selected+'.conf')).exists():
         runtime['tunnel'](selected)
+        # DNS upstream sockets are bound to awg0; recreating the interface must
+        # rebind them, even when the selected profile did not change.
+        call('systemctl','--no-block','try-restart','e-dev-dns.service',check=False)
     runtime['guard'](mode)
 
 

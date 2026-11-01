@@ -5,7 +5,7 @@ REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID == 0 ]] || { echo 'Требуется root' >&2; exit 1; }
 python3 "$REPO_DIR/scripts/build_wiki.py"
 install -m 755 "$REPO_DIR/src/e-dev" /usr/local/bin/e-dev
-for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui e-dev-tui e-dev-actions e-dev-settings e-dev-diagnostics e-dev-incus-ready e-dev-radio; do
+for component in e-dev-vpn e-dev-policy e-dev-hybrid e-dev-geo-update e-dev-awg-launch e-dev-dashboard e-dev-wifi e-dev-lan e-dev-lan-ui e-dev-tui e-dev-actions e-dev-settings e-dev-diagnostics e-dev-incus-ready e-dev-radio e-dev-dns-config; do
     install -m 755 "$REPO_DIR/src/$component" "/usr/local/sbin/$component"
 done
 for alias_name in E-DEV E-dev edev; do ln -sfn /usr/local/bin/e-dev "/usr/local/bin/$alias_name"; done
@@ -26,6 +26,10 @@ install -d -m 755 /etc/systemd/journald.conf.d
 install -m 644 "$REPO_DIR/config/journald/e-dev.conf" /etc/systemd/journald.conf.d/e-dev.conf
 install -d -m 755 /etc/NetworkManager/dnsmasq-shared.d
 install -m 644 "$REPO_DIR/config/e-dev-diagnostics-dhcp.conf" /etc/NetworkManager/dnsmasq-shared.d/e-dev-diagnostics.conf
+install -d -m 755 /etc/e-dev
+install -m 644 "$REPO_DIR/config/e-dev-dns-resilience.conf" /etc/e-dev/dns-resilience.conf
+if [[ ! -f /etc/e-dev/vpn-domains ]]; then install -m 644 "$REPO_DIR/config/vpn-domains" /etc/e-dev/vpn-domains; fi
+if [[ -f /etc/e-dev/dns.conf ]]; then /usr/local/sbin/e-dev-dns-config; fi
 dnsmasq --test --conf-file=/dev/null --conf-dir=/etc/NetworkManager/dnsmasq-shared.d
 install -m 644 "$REPO_DIR/scripts/bootstrap_lxconsole.py" /opt/e-dev/bootstrap_lxconsole.py
 # This was a one-time override on the original Pi; the shipped service includes it.

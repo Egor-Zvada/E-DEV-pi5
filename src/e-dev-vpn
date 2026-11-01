@@ -86,12 +86,22 @@ def split(mode):
   geo_load()
  if call('nft','list','set','inet','e_dev_split','custom4',check=False).returncode:
   call('nft','-f','-',input='add set inet e_dev_split custom4 { type ipv4_addr; flags interval; auto-merge; }\n')
+ if call('nft','list','set','inet','e_dev_split','vpn4',check=False).returncode:
+  call('nft','-f','-',input='add set inet e_dev_split vpn4 { type ipv4_addr; flags timeout; timeout 1h; }\n')
  custom_load()
  batch='flush chain inet e_dev_split classify\n'
  if mode=='hybrid':
-  for name in (['rusubnets'] if hybrid_cfg()['geo'] else [])+['ru4','custom4']:
-   batch+='add rule inet e_dev_split classify ip saddr '+str(ap_interface().network)+' ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter\n'
-  batch+='add rule inet e_dev_split classify ct mark 0x42 meta mark set 0x42\n'
+  prefix='add rule inet e_dev_split classify ip saddr '+str(ap_interface().network)
+  local='{ '+', '.join(sorted(set(net for net,dev in local_routes())))+' }'
+  batch+=prefix+' ip daddr '+local+' meta mark set 0 ct mark set 0 return\n'
+  # Explicit direct rules win over VPN-domain exceptions; VPN-domain exceptions
+  # win over GeoIP. A foreign service may use a server with a Russian IP.
+  for name in ('custom4','ru4'):
+   batch+=prefix+' ip daddr @'+name+' meta mark set 0x42 ct mark set 0x42 counter return\n'
+  batch+=prefix+' ip daddr @vpn4 meta mark set 0 ct mark set 0 counter return\n'
+  if hybrid_cfg()['geo']:
+   batch+=prefix+' ip daddr @rusubnets meta mark set 0x42 ct mark set 0x42 counter return\n'
+  batch+=prefix+' ct mark 0x42 meta mark set 0x42\n'
  call('nft','-f','-',input=batch)
 def guard(mode):
  split(mode)

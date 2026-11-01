@@ -14,17 +14,12 @@ def save(data):
 def words(name):
  p=B/name;return sorted(set(p.read_text().split())) if p.exists() else []
 def dns_reload():
- domains=words('direct-domains');data=cfg()
- wifi=B/'wifi.json';ap=I.IPv4Interface(json.loads(wifi.read_text()).get('address','10.42.0.1/24') if wifi.exists() else '10.42.0.1/24')
- s='port=1053\nlisten-address='+str(ap.ip)+'\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=1000\n'
- s+=''.join('server='+x+'@awg0\n' for x in data['dns'])
- if domains: s+='nftset=/'+ '/'.join(domains)+'/4#inet#e_dev_split#ru4\n'
- p=B/'dns.conf';p.write_text(s)
- run('nft','flush','set','inet','e_dev_split','ru4')
- run('systemctl','restart','e-dev-dns')
- # Shared AP DNS in direct mode. Active AP is not bounced by settings changes.
- P.Path('/etc/NetworkManager/dnsmasq-shared.d/e-dev-upstream.conf').write_text('no-resolv\n'+''.join('server='+x+'\n' for x in data['dns']))
- # DNS interception for direct AP is separate, so this config applies on next AP activation.
+ run('/usr/local/sbin/e-dev-dns-config')
+ with open('/run/e-dev-vpn.lock','w') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  runtime=runpy.run_path('/usr/local/sbin/e-dev-vpn');runtime['guard'](runtime['readmode']())
+  for name in ('ru4','vpn4'):run('nft','flush','set','inet','e_dev_split',name)
+  run('systemctl','restart','e-dev-dns')
 
 def apply():
  with open('/run/e-dev-vpn.lock','w') as lock:
@@ -40,14 +35,15 @@ def show():
  print('Автообновление базы: '+('ежедневно' if data['autoupdate'] else 'выключено'))
  print('DNS: '+', '.join(data['dns']))
  print('Прямых доменных правил: '+str(len(words('direct-domains'))))
+ print('Доменов через VPN поверх GeoIP: '+str(len(words('vpn-domains'))))
  print('Своих прямых IP/сетей: '+str(len(words('direct-ips'))))
  print('Без интернета остаётся последняя сохранённая IP-база. Настройки не включают режим hybrid автоматически.')
 
 def edit(kind,action,value=None):
- filename='direct-domains' if kind=='domains' else 'direct-ips';values=set(words(filename))
+ filename={'domains':'direct-domains','vpn-domains':'vpn-domains','ips':'direct-ips'}[kind];values=set(words(filename))
  if action=='list': print('\n'.join(sorted(values)) or 'Список пуст.');return
  if action not in ('add','del') or not value: raise ValueError('Нужно list, add VALUE или del VALUE.')
- if kind=='domains':
+ if kind in ('domains','vpn-domains'):
   value=value.lower().strip('.').encode('idna').decode('ascii')
   if not re.fullmatch(r'[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?',value) or len(value)>253 or any(not x or len(x)>63 or x.startswith('-') or x.endswith('-') for x in value.split('.')): raise ValueError('Нужен домен без https:// и пути.')
  else:
@@ -57,14 +53,14 @@ def edit(kind,action,value=None):
  if action=='add': values.add(value)
  else: values.discard(value)
  (B/filename).write_text('\n'.join(sorted(values))+'\n')
- if kind=='domains': dns_reload()
+ if kind in ('domains','vpn-domains'): dns_reload()
  else: apply()
  print('Правило '+('добавлено: ' if action=='add' else 'удалено: ')+value)
 
 def execute(args):
  command=args[0]
  if command in ('show','status'): show()
- elif command in ('domains','ips'): edit(command,args[1] if len(args)>1 else 'list',args[2] if len(args)>2 else None)
+ elif command in ('domains','vpn-domains','ips'): edit(command,args[1] if len(args)>1 else 'list',args[2] if len(args)>2 else None)
  elif command in ('geo','autoupdate'):
   value=args[1] if len(args)>1 else 'status'
   if value=='update' and command=='geo': run('/usr/local/sbin/e-dev-geo-update');return

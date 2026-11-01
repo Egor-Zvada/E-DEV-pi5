@@ -4,6 +4,7 @@ Description=E-DEV daily VPN speed selection
 [Timer]
 OnBootSec=3min
 OnCalendar=*-*-* 04:15:00
+OnUnitInactiveSec=15min
 RandomizedDelaySec=5min
 Persistent=true
 

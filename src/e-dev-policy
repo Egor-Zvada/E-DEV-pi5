@@ -2,6 +2,7 @@
 """VPN selection, isolated probes and measured daily ranking. No secret logs."""
 import pathlib as P, subprocess as S, json, sys, time, fcntl, re, hashlib, contextlib, datetime, os, signal, pwd
 B=P.Path('/etc/e-dev');R='/usr/local/sbin/e-dev-vpn'
+DIAGNOSTICS=P.Path('/var/log/e-dev-diagnostics')
 def run(*args,check=False,input=None,timeout=None):
  env=dict(os.environ,WG_QUICK_USERSPACE_IMPLEMENTATION='/usr/local/sbin/e-dev-awg-launch') if args[0]=='awg-quick' else None
  if args[0]=='/usr/local/bin/speedtest':
@@ -104,13 +105,44 @@ def active_speedtest():
  print('Сервер Speedtest: '+row['server']+'; трафик теста: '+str(round(row['bytes']/1000000,1))+' MB')
  print('VPN-профиль и режим выбора не изменены.')
 
-def auto(force=False,apply_cached=False):
+def recent_client_activity(now=None):
+ now=time.time() if now is None else now
+ rows=[]
+ for filename in ('samples.1.jsonl','samples.jsonl'):
+  path=DIAGNOSTICS/filename
+  try:
+   with path.open('rb') as stream:
+    stream.seek(max(0,path.stat().st_size-131072))
+    text=stream.read().decode('utf-8','replace')
+   for line in text.splitlines():
+    try:
+     row=json.loads(line)
+     if now-120<=row['time']<=now:rows.append(row)
+    except (ValueError,KeyError,TypeError):pass
+  except OSError:pass
+ rows.sort(key=lambda r:r['time'])
+ if len(rows)<2 or now-rows[-1]['time']>30 or rows[-1]['time']-rows[0]['time']<60 or any(row.get('maintenance') for row in rows):return None
+ def counters(row):
+  names={row.get('config',{}).get('out','wlan0'),'incusbr0','vpnbr0'}
+  return {link['name']:sum(link.get('stats',{}).get(k,{}).get('bytes',0) for k in ('rx','tx')) for link in row.get('links',[]) if link.get('name') in names}
+ for before,after in zip(rows,rows[1:]):
+  seconds=after['time']-before['time']
+  if not 0<seconds<=30:return None
+  a,b=counters(before),counters(after)
+  out_a=before.get('config',{}).get('out','wlan0');out_b=after.get('config',{}).get('out','wlan0')
+  if not a or not b or out_a!=out_b or out_a not in a or out_b not in b:return None
+  rate=sum(max(0,b[n]-a[n]) for n in a.keys()&b.keys())/seconds
+  if rate>32*1024:return True
+ return False
+
+def auto(force=False,apply_cached=False,background=False):
  config=cfg()
  if config['mode']!='auto': print('Auto не выбран; ежедневный замер пропущен.');return
  if not enabled(): print('VPN выключен; замер пропущен.');return
  data=read('vpn-speeds.json',{})
- today=datetime.datetime.now().astimezone().date().isoformat()
- if not force and data.get('day')==today:
+ local=datetime.datetime.now().astimezone();today=local.date().isoformat()
+ successful=any(row.get('ok') for row in data.get('results',[])) if 'results' in data else bool(data.get('ranking'))
+ if not force and data.get('day')==today and successful:
   print('Сегодня уже измеряли; используется сохранённый рейтинг.')
   if apply_cached:
    for name in data.get('ranking',[]):
@@ -123,6 +155,16 @@ def auto(force=False,apply_cached=False):
      print('Auto выбрал по сохранённому рейтингу: '+name);return
    print('Доступный профиль из рейтинга не найден; текущий выбор сохранён.')
   return
+ if background:
+  if data and data.get('day')!=today and (local.hour,local.minute)<(4,15):
+   print('Дневной AUTO ожидает 04:15; текущий профиль и проверка доступности сохранены.');return
+  busy=recent_client_activity()
+  if busy is not False:
+   print('AUTO отложен: клиентский трафик за последние 2 минуты.' if busy else 'AUTO отложен: пока нет свежей истории клиентского трафика.')
+   return
+  if not alive() or not probe('awg0'):
+   print('AUTO отложен: сначала требуется восстановить VPN; проверка доступности продолжает работать.')
+   return
  rows=[]
  for name in profiles():
   print('Измеряю '+name+'…',flush=True);row=measure(name);rows.append(row)
@@ -230,7 +272,7 @@ def main(args):
    elif command=='default' and len(args)==1 and cfg().get('primary') in profiles():
     config=cfg();set_mode(['default',config['primary'],config.get('backup') or '-'])
    else: set_mode(args)
-  elif command=='auto-daily': auto()
+  elif command=='auto-daily': auto(background=True)
   elif command=='health': health()
   elif command=='speedtest': active_speedtest()
   elif command=='status': show()

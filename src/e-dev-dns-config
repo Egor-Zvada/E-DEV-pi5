@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Render and validate managed DNS files before replacing either running configuration."""
+import ipaddress as I
+import json
+import os
+import pathlib as P
+import re
+import subprocess as S
+import sys
+
+BASE=P.Path('/etc/e-dev')
+SHARED=P.Path('/etc/NetworkManager/dnsmasq-shared.d/e-dev-upstream.conf')
+
+
+def read(path,default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def domains(path):
+    values=sorted(set(path.read_text().split())) if path.exists() else []
+    for name in values:
+        if len(name)>253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',part) for part in name.split('.')):
+            raise ValueError('Некорректное доменное правило DNS.')
+    return values
+
+
+def render(base=BASE):
+    cfg=read(base/'hybrid.json',dict(dns=['1.1.1.1','8.8.8.8']))
+    servers=[str(I.IPv4Address(x)) for x in cfg['dns']]
+    if not 1<=len(servers)<=3 or not all(I.IPv4Address(x).is_global for x in servers):raise ValueError('Нужны 1–3 публичных DNS IPv4.')
+    address=I.IPv4Interface(read(base/'wifi.json',{}).get('address','10.42.0.1/24')).ip
+    policy='conf-file='+str(base/'dns-resilience.conf')+'\n'
+    vpn='port=1053\nlisten-address='+str(address)+'\nbind-dynamic\nuser=root\nno-hosts\nno-resolv\ncache-size=4096\n'+policy
+    vpn+=''.join('server='+x+'@awg0\n' for x in servers)
+    for filename,group in (('direct-domains','ru4'),('vpn-domains','vpn4')):
+        names=domains(base/filename)
+        if names:vpn+='nftset=/'+'/'.join(names)+'/4#inet#e_dev_split#'+group+'\n'
+    shared='no-resolv\ncache-size=4096\n'+policy+''.join('server='+x+'\n' for x in servers)
+    return vpn,shared
+
+
+def configure(base=BASE,shared=SHARED):
+    values=render(base);targets=(base/'dns.conf',shared);temporary=[]
+    try:
+        for path,data in zip(targets,values):
+            path.parent.mkdir(parents=True,exist_ok=True)
+            temp=path.with_name(path.name+'.new')
+            fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w') as stream:os.fchmod(stream.fileno(),0o600);stream.write(data)
+            temporary.append(temp)
+            result=S.run(['dnsmasq','--test','--conf-file='+str(temp)],text=True,capture_output=True,timeout=5)
+            if result.returncode:raise ValueError('DNS-конфигурация не прошла проверку: '+result.stderr.strip()[:300])
+        for temp,path in zip(temporary,targets):temp.chmod(0o644);temp.replace(path)
+    finally:
+        for path in temporary:path.unlink(missing_ok=True)
+
+
+if __name__=='__main__':
+    try:
+        if os.geteuid()!=0:raise ValueError('Требуется sudo.')
+        configure();print('DNS-конфигурации проверены и сохранены.')
+    except (OSError,ValueError,S.SubprocessError) as error:print(str(error),file=sys.stderr);sys.exit(1)

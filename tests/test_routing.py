@@ -13,6 +13,16 @@ loader.exec_module(r)
 
 
 class RoutingTests(unittest.TestCase):
+    def test_hybrid_explicit_direct_then_vpn_domains_then_geoip(self):
+        with patch.object(r,'call',return_value=types.SimpleNamespace(returncode=1,stdout='[]')) as call,patch.object(r,'custom_load'),patch.object(r,'geo_load'):
+            r.split('hybrid')
+        batch=call.call_args.kwargs['input']
+        self.assertLess(batch.index('@custom4'),batch.index('@ru4'))
+        self.assertLess(batch.index('@ru4'),batch.index('@vpn4'))
+        self.assertLess(batch.index('@vpn4'),batch.index('@rusubnets'))
+        self.assertIn('@vpn4 meta mark set 0 ct mark set 0 counter return',batch)
+        self.assertIn('meta mark set 0 ct mark set 0 return',batch)
+
     def test_tunnel_failure_keeps_home_lan_open_without_an_internet_exit(self):
         with patch.object(r,'local_routes',return_value=[('10.42.0.0/24','wlan0'),('192.168.100.0/24','eth0')]):
             blocked=r.rules('blocked')

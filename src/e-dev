@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """E-DEV local control. Root-owned; no arbitrary shell execution."""
-import time, ipaddress, fcntl, contextlib
+import time, ipaddress, fcntl, contextlib, runpy
 import sys, os, subprocess as sp, pathlib as P, json, re, getpass, tempfile, shutil
 BASE=P.Path('/etc/e-dev'); DOC=P.Path('/opt/e-dev/docs'); STATE=BASE/'mode'; PROFILES=BASE/'profiles'
 def system_config():
@@ -183,21 +183,28 @@ def set_contains(name,addr):
 
 def route_check(host):
     root()
+    current_mode=mode()
+    local=runpy.run_path('/usr/local/sbin/e-dev-vpn')['local_routes']()
     try: addresses=[str(ipaddress.IPv4Address(host))]
     except ValueError:
         host=host.strip('.').encode('idna').decode('ascii')
         if not re.fullmatch(r'[a-zA-Z0-9.-]{1,253}',host) or host.startswith('-'): fail('Нужен домен без https:// и пути.')
-        text=out(['dig','+short','+time=3','+tries=1','@'+ap_address(),'-p','1053',host,'A'])
+        text=out(['dig','+short','+time=3','+tries=1','@'+ap_address(),'-p','53' if current_mode=='direct' else '1053',host,'A'])
         addresses=[]
         for line in text.splitlines():
             try: addresses.append(str(ipaddress.IPv4Address(line)))
             except ValueError: pass
     if not addresses: fail('DNS не вернул IPv4. Проверьте e-dev vpn status и e-dev-dns.')
     for addr in addresses:
+        device=next((dev for net,dev in local if ipaddress.IPv4Address(addr) in ipaddress.IPv4Network(net)),None)
+        if device:
+            print(host+' → '+addr+' → локальная сеть · '+device+' (подключённая подсеть)')
+            continue
         settings=BASE/'hybrid.json';geo=json.loads(settings.read_text()).get('geo',True) if settings.exists() else True
         ru=geo and set_contains('rusubnets',addr);domain=set_contains('ru4',addr);custom=set_contains('custom4',addr)
-        direct=mode()=='direct' or (mode()=='hybrid' and (ru or domain or custom))
-        reason='свой IP/сеть' if custom else 'RU IP-база' if ru else 'доменное исключение' if domain else 'общий маршрут'
+        forced=set_contains('vpn4',addr)
+        direct=current_mode=='direct' or (current_mode=='hybrid' and (domain or custom or ru and not forced))
+        reason='VPN OFF' if current_mode=='direct' else 'VPN ON' if current_mode!='hybrid' else 'свой IP/сеть' if custom else 'доменное исключение' if domain else 'VPN-домен поверх GeoIP' if forced else 'RU IP-база' if ru else 'общий маршрут'
         print(host+' → '+addr+' → '+('провайдер' if direct else 'VPN')+' ('+reason+')')
     print('Это проверка выбора маршрута AP, не проверка открытия приложения.')
 

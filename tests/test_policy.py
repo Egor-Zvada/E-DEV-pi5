@@ -16,6 +16,32 @@ class SpeedtestEnvironmentTests(unittest.TestCase):
    self.assertEqual(run.call_args.kwargs['env']['HOME'],'/var/lib/test-speedtest')
 
 class PolicyTests(unittest.TestCase):
+ def test_background_auto_defers_busy_or_unknown_clients_without_changing_ranking(self):
+  p.save('vpn-policy.json',{'mode':'auto','primary':'a','backup':'b'})
+  for state in (True,None):
+   with patch.object(p,'recent_client_activity',return_value=state),patch.object(p,'measure') as measure:
+    p.auto(background=True);measure.assert_not_called()
+  self.assertFalse((p.B/'vpn-speeds.json').exists());self.sw.assert_not_called()
+ def test_failed_today_is_retried_when_idle_and_vpn_is_alive(self):
+  p.save('vpn-policy.json',{'mode':'auto','primary':'a','backup':'b'})
+  p.save('vpn-speeds.json',{'day':datetime.datetime.now().astimezone().date().isoformat(),'results':[{'name':'a','ok':False}],'ranking':['b']})
+  with patch.object(p,'recent_client_activity',return_value=False),patch.object(p,'probe',return_value=True),patch.object(p,'measure',side_effect=lambda n:{'name':n,'ok':True,'mbps':10,'ping_ms':10}) as measure:
+   p.auto(background=True);self.assertEqual(measure.call_count,3)
+ def test_background_auto_leaves_recovery_to_health_if_active_vpn_is_down(self):
+  p.save('vpn-policy.json',{'mode':'auto','primary':'a','backup':'b'})
+  with patch.object(p,'recent_client_activity',return_value=False),patch.object(p,'probe',return_value=False),patch.object(p,'measure') as measure:
+   p.auto(background=True);measure.assert_not_called()
+ def test_activity_history_detects_bursts_even_if_latest_sample_is_idle(self):
+  with tempfile.TemporaryDirectory() as temp,patch.object(p,'DIAGNOSTICS',pathlib.Path(temp)):
+   def sample(stamp,amount):return dict(time=stamp,config={'out':'edevbr0'},links=[dict(name='edevbr0',stats={'rx':{'bytes':amount},'tx':{'bytes':0}})])
+   rows=[sample(stamp,0) for stamp in range(1000,1121,10)]
+   path=p.DIAGNOSTICS/'samples.jsonl'
+   path.write_text('\n'.join(json.dumps(row) for row in rows))
+   self.assertFalse(p.recent_client_activity(1120))
+   for row in rows[4:]:row['links'][0]['stats']['rx']['bytes']=2**22
+   path.write_text('\n'.join(json.dumps(row) for row in rows))
+   self.assertTrue(p.recent_client_activity(1120))
+   self.assertIsNone(p.recent_client_activity(1200))
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.addCleanup(patch.stopall)

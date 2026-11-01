@@ -117,8 +117,8 @@ def radio_menu(ui):
     wifi=load('e-dev-wifi')
     while True:
         data=wifi.radio_current()
-        choice=ui.menu('AP · Wi-Fi',data['ssid']+' · '+('2.4 GHz' if data['band']=='bg' else '5 GHz')+' · канал '+(str(data['channel']) if data['channel'] else 'AUTO')+'\nЗащита WPA2 / AES-CCMP',
-                       [('ssid','Название сети'),('radio','Диапазон и канал'),('password','Пароль Wi-Fi')])
+        choice=ui.menu('AP · Wi-Fi',data['ssid']+' · '+('2.4 GHz' if data['band']=='bg' else '5 GHz')+' · канал '+(str(data['channel']) if data['channel'] else 'AUTO')+' · ширина '+(str(data.get('width',0))+' MHz' if data.get('width') else 'AUTO')+'\nЗащита WPA2 / AES-CCMP',
+                       [('ssid','Название сети'),('radio','Диапазон и канал'),('width','Ширина канала'),('password','Пароль Wi-Fi')])
         if choice is None: return
         if choice=='password': password(ui,'wifi');continue
         if choice=='ssid':
@@ -135,6 +135,12 @@ def radio_menu(ui):
             if channel=='custom': channel=ui.input('Канал AP','Номер канала; 0 — автоматически.',str(data['channel']))
             if channel is None: continue
             data.update(band=band,channel=int(channel))
+            if not data['channel'] or band=='bg' and data.get('width',0)>40:data['width']=0
+        elif choice=='width':
+            widths=(0,20,40,80) if data['band']=='a' else (0,20,40)
+            value=ui.menu('Ширина канала','80 MHz доступно на 5 GHz. Для фиксированной ширины выберите конкретный канал.',[(str(n),'AUTO' if n==0 else str(n)+' MHz') for n in widths])
+            if value is None:continue
+            data['width']=int(value)
         data=wifi.validate_radio(data)
         if not ui.yes('Применить AP?',data['ssid']+' · '+data['band']+' · канал '+str(data['channel'])+'\nWi-Fi переподключится. При ошибке служба выполнит откат.'):
             continue
@@ -144,15 +150,15 @@ def radio_menu(ui):
 
 def direct_rules(ui,kind):
     hybrid=load('e-dev-hybrid')
-    title='Прямые домены' if kind=='domains' else 'Прямые IP / сети'
-    filename='direct-domains' if kind=='domains' else 'direct-ips'
+    title={'domains':'Прямые домены','vpn-domains':'Домены через VPN','ips':'Прямые IP / сети'}[kind]
+    filename={'domains':'direct-domains','vpn-domains':'vpn-domains','ips':'direct-ips'}[kind]
     while True:
         values=hybrid.words(filename)
-        choice=ui.menu(title,'Эти назначения идут напрямую в режиме HYBRID.',
+        choice=ui.menu(title,'Эти домены используют VPN вместо GeoIP в HYBRID.' if kind=='vpn-domains' else 'Эти назначения идут напрямую в режиме HYBRID.',
                        [('add','Добавить правило')]+[('rule:'+value,value) for value in values])
         if choice is None: return
         if choice=='add':
-            value=ui.input(title,'Домен без https:// и пути:' if kind=='domains' else 'Публичный IPv4 или сеть CIDR:')
+            value=ui.input(title,'Домен без https:// и пути:' if kind in ('domains','vpn-domains') else 'Публичный IPv4 или сеть CIDR:')
             if value: action(ui,title,'hybrid',kind,'add',value)
         else:
             value=choice.removeprefix('rule:')
@@ -171,12 +177,12 @@ def hybrid_menu(ui):
                        [('geo','Учёт RU IP-базы · '+('ВКЛ' if data['geo'] else 'ВЫКЛ')),
                         ('autoupdate','Ежедневное обновление · '+('ВКЛ' if data['autoupdate'] else 'ВЫКЛ')),
                         ('update','Обновить IP-базу сейчас'),('domains','Прямые домены'),
-                        ('ips','Прямые IP / сети'),('check','Проверить маршрут домена / IP')])
+                        ('ips','Прямые IP / сети'),('vpn-domains','Домены через VPN'),('check','Проверить маршрут домена / IP')])
         if choice is None: return
         if choice in ('geo','autoupdate'):
             action(ui,'Hybrid Settings','hybrid',choice,'off' if data[choice] else 'on')
         elif choice=='update': action(ui,'RU IP-база','hybrid','geo','update')
-        elif choice in ('domains','ips'): direct_rules(ui,choice)
+        elif choice in ('domains','ips','vpn-domains'): direct_rules(ui,choice)
         elif choice=='check':
             value=ui.input('Проверка маршрута','Домен или IPv4:')
             if value: action(ui,'Маршрут','check',value)

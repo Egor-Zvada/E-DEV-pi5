@@ -101,6 +101,11 @@ def validate_radio(data):
     if band not in ('bg', 'a') or not 0 <= channel <= 196 or band=='bg' and channel>14:
         raise ValueError('Нужен диапазон 2.4/5 GHz и допустимый канал; 0 — автоматически.')
     result = dict(ssid=ssid, band=band, channel=channel)
+    if 'width' in data:
+        width=int(data['width'])
+        if width not in (0,20,40,80) or band=='bg' and width==80 or width and not channel:
+            raise ValueError('Ширина: AUTO, 20/40 MHz; 80 MHz только для 5 GHz. Для фиксированной ширины нужен канал.')
+        result['width']=width
     if 'psk' in data:
         p = data['psk']
         if not 8<=len(p)<=63 or any(ord(c)<32 or ord(c)>126 for c in p):
@@ -111,13 +116,13 @@ def validate_radio(data):
 
 RADIO_FIELDS = ['802-11-wireless.ssid', '802-11-wireless.band', '802-11-wireless.channel',
                 '802-11-wireless-security.key-mgmt', '802-11-wireless-security.proto',
-                '802-11-wireless-security.pairwise', '802-11-wireless-security.group']
+                '802-11-wireless-security.pairwise', '802-11-wireless-security.group', '802-11-wireless.channel-width']
 
 
 def radio_current():
-    values = call('nmcli', '--escape', 'no', '-g', ','.join(RADIO_FIELDS[:3]),
+    values = call('nmcli', '--escape', 'no', '-g', ','.join(RADIO_FIELDS[:3]+RADIO_FIELDS[-1:]),
                   'connection', 'show', CONNECTION).split('\n')
-    return dict(ssid=values[0], band=values[1] or 'bg', channel=int(values[2] or 0))
+    return dict(ssid=values[0], band=values[1] or 'bg', channel=int(values[2] or 0),width=int(values[3] or 0))
 
 
 def radio_profiles():
@@ -138,6 +143,7 @@ def radio_modify(data):
         password = data.get('psk') or call('nmcli','--show-secrets','-g','802-11-wireless-security.psk','connection','show',profile)
         call('nmcli', 'connection', 'modify', profile, 'wifi.ssid', data['ssid'], 'wifi.band', data['band'],
              'wifi.channel', str(data['channel']) if data['channel'] else '', 'wifi-sec.key-mgmt', 'wpa-psk',
+             'wifi.channel-width',str(data.get('width',0)),
              'wifi-sec.proto', 'rsn', 'wifi-sec.pairwise', 'ccmp', 'wifi-sec.group', 'ccmp')
         lan['set_password'](profile, password)
 
